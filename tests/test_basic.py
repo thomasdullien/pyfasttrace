@@ -296,6 +296,131 @@ def test_c_converter_exceptions(trace_dir):
     assert entries == 20
 
 
+# ── Perfetto integration tests ─────────────────────────────────────────
+
+
+def test_perfetto_loads_trace(trace_dir):
+    """Verify Perfetto trace_processor can load our JSON and query slices."""
+    from fasttracer import FastTracer, ftrc2json
+    from perfetto.trace_processor import TraceProcessor
+
+    def fib(n):
+        if n <= 1:
+            return 1
+        return fib(n - 1) + fib(n - 2)
+
+    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+        fib(12)
+
+    json_path = os.path.join(trace_dir, "out.json")
+    ftrc2json(t.output_path, json_path)
+
+    tp = TraceProcessor(trace=json_path)
+    try:
+        # Should have slices
+        result = tp.query("SELECT count(*) as cnt FROM slice")
+        rows = list(result)
+        assert len(rows) == 1
+        assert rows[0].cnt > 0, "No slices found in trace"
+
+        # Should have our fib function
+        result = tp.query("SELECT DISTINCT name FROM slice WHERE name LIKE '%fib%'")
+        fib_names = [row.name for row in result]
+        assert len(fib_names) > 0, "No 'fib' slices found"
+
+        # Every slice should have non-negative duration, except for the
+        # tracer's own shutdown calls (__exit__, stop) which are entered
+        # but never exited because tracing stops mid-call.
+        result = tp.query(
+            "SELECT count(*) as cnt FROM slice WHERE dur < 0 "
+            "AND name NOT LIKE '%FastTracer%' AND name NOT LIKE '%stop%'"
+        )
+        rows = list(result)
+        assert rows[0].cnt == 0, "Found non-tracer slices with negative duration"
+
+        # Timestamps should be non-negative
+        result = tp.query("SELECT count(*) as cnt FROM slice WHERE ts < 0")
+        rows = list(result)
+        assert rows[0].cnt == 0, "Found slices with negative timestamp"
+    finally:
+        tp.close()
+
+
+def test_perfetto_balanced_events(trace_dir):
+    """Verify Perfetto sees balanced call stacks (no orphan begin/end)."""
+    from fasttracer import FastTracer, ftrc2json
+    from perfetto.trace_processor import TraceProcessor
+
+    def outer():
+        return inner()
+
+    def inner():
+        return 42
+
+    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+        for _ in range(50):
+            outer()
+
+    json_path = os.path.join(trace_dir, "out.json")
+    ftrc2json(t.output_path, json_path)
+
+    tp = TraceProcessor(trace=json_path)
+    try:
+        # Every slice should have a valid duration (>= 0)
+        # If events were unbalanced, Perfetto would produce slices with
+        # dur = -1 or very large durations
+        result = tp.query(
+            "SELECT count(*) as cnt FROM slice "
+            "WHERE name LIKE '%outer%' OR name LIKE '%inner%'"
+        )
+        rows = list(result)
+        assert rows[0].cnt == 100, (
+            f"Expected 100 slices (50×outer + 50×inner), got {rows[0].cnt}"
+        )
+
+        # Check all those slices have reasonable durations (< 1 second)
+        result = tp.query(
+            "SELECT count(*) as cnt FROM slice "
+            "WHERE (name LIKE '%outer%' OR name LIKE '%inner%') AND dur > 1000000000"
+        )
+        rows = list(result)
+        assert rows[0].cnt == 0, "Found slices with unreasonably large duration"
+    finally:
+        tp.close()
+
+
+def test_perfetto_thread_info(trace_dir):
+    """Verify Perfetto can see thread metadata from our traces."""
+    from fasttracer import FastTracer, ftrc2json
+    from perfetto.trace_processor import TraceProcessor
+
+    def work():
+        return sum(range(100))
+
+    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+        work()
+
+    json_path = os.path.join(trace_dir, "out.json")
+    ftrc2json(t.output_path, json_path)
+
+    tp = TraceProcessor(trace=json_path)
+    try:
+        # Should have at least one thread track
+        result = tp.query("SELECT count(*) as cnt FROM thread")
+        rows = list(result)
+        assert rows[0].cnt > 0, "No threads found in trace"
+
+        # Should have at least one process
+        result = tp.query("SELECT count(*) as cnt FROM process")
+        rows = list(result)
+        assert rows[0].cnt > 0, "No processes found in trace"
+    finally:
+        tp.close()
+
+
+# ── C converter multi-file test ────────────────────────────────────────
+
+
 def test_c_converter_multiple_files(trace_dir):
     """Test C converter merging multiple .ftrc files."""
     from fasttracer import FastTracer, ftrc2json
