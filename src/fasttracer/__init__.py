@@ -1,4 +1,24 @@
+import os
+import subprocess
+
 from fasttracer._fasttracer import FastTracer as _FastTracer
+
+# Path to the C converter binary, installed alongside the package
+_FTRC2JSON_PATH = os.path.join(os.path.dirname(__file__), "ftrc2json")
+
+
+def ftrc2json(input_paths, output_path):
+    """Convert .ftrc file(s) to Chrome Trace JSON using the C converter.
+
+    Args:
+        input_paths: str or list of str — paths to .ftrc files
+        output_path: str — path for the output .json file
+    """
+    if isinstance(input_paths, str):
+        input_paths = [input_paths]
+
+    cmd = [_FTRC2JSON_PATH, "-o", output_path] + input_paths
+    subprocess.check_call(cmd)
 
 
 class FastTracer:
