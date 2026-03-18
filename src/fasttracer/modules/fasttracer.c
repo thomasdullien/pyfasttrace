@@ -18,6 +18,7 @@ static uint16_t ft_intern_function(FastTracerObject* self, PyObject* func_obj, i
 static struct ThreadStack* ft_get_thread_stack(FastTracerObject* self);
 static uint8_t ft_get_tid_idx(FastTracerObject* self);
 static void ft_rollover(FastTracerObject* self);
+static PyObject* ft_thread_profile_func(PyObject* obj, PyObject* args);
 
 /* ── File path helper ──────────────────────────────────────────────── */
 
@@ -832,14 +833,26 @@ FastTracer_start(FastTracerObject* self, PyObject* Py_UNUSED(unused))
 #else
     PyEval_SetProfile(ft_profile_callback, (PyObject*)self);
 
-    /* Also set profile for future threads via threading.setprofile */
-    PyObject* threading = PyImport_ImportModule("threading");
-    if (threading) {
-        PyObject* r = PyObject_CallMethod(threading, "setprofile", "O", (PyObject*)self);
-        Py_XDECREF(r);
-        Py_DECREF(threading);
+    /* Also set profile for future threads via threading.setprofile.
+     * We create a PyCFunction wrapping ft_thread_profile_func with
+     * self as the bound object. This is a proper Python callable that
+     * threading.setprofile can invoke as func(frame, event, arg). */
+    {
+        static PyMethodDef ml = {
+            "ft_thread_profile_func",
+            (PyCFunction)ft_thread_profile_func,
+            METH_VARARGS,
+            "FastTracer thread profile hook"
+        };
+        PyObject* threading = PyImport_ImportModule("threading");
+        if (threading) {
+            PyObject* handler = PyCFunction_New(&ml, (PyObject*)self);
+            PyObject* r = PyObject_CallMethod(threading, "setprofile", "N", handler);
+            Py_XDECREF(r);
+            Py_DECREF(threading);
+        }
+        PyErr_Clear();
     }
-    PyErr_Clear();
 #endif
 
     Py_RETURN_NONE;
@@ -880,6 +893,46 @@ FastTracer_get_output_path(FastTracerObject* self, PyObject* Py_UNUSED(unused))
     char path[512];
     ft_make_output_path(self, path, sizeof(path));
     return PyUnicode_FromString(path);
+}
+
+/* ── Thread profile hook for threading.setprofile ─────────────────── */
+/*
+ * Python-level profile function passed to threading.setprofile().
+ * When a new thread starts, Python calls this as func(frame, event, arg).
+ * We install the fast C-level profiler on the thread and also process
+ * the first event so it isn't lost.
+ *
+ * Created via PyCFunction_New with the FastTracer object as 'self',
+ * following the same pattern as VizTracer's tracer_threadtracefunc.
+ */
+static PyObject*
+ft_thread_profile_func(PyObject* obj, PyObject* args)
+{
+    FastTracerObject* self = (FastTracerObject*)obj;
+    PyFrameObject* frame = NULL;
+    const char* event = NULL;
+    PyObject* trace_arg = NULL;
+
+    if (!PyArg_ParseTuple(args, "OsO", &frame, &event, &trace_arg)) {
+        Py_RETURN_NONE;
+    }
+
+    /* Install the C-level profiler on this thread */
+    PyEval_SetProfile(ft_profile_callback, obj);
+
+    /* Process the first event so it isn't lost */
+    int what = -1;
+    if      (strcmp(event, "call") == 0)        what = PyTrace_CALL;
+    else if (strcmp(event, "return") == 0)      what = PyTrace_RETURN;
+    else if (strcmp(event, "c_call") == 0)      what = PyTrace_C_CALL;
+    else if (strcmp(event, "c_return") == 0)    what = PyTrace_C_RETURN;
+    else if (strcmp(event, "c_exception") == 0) what = PyTrace_C_EXCEPTION;
+
+    if (what >= 0 && self->collecting) {
+        ft_profile_callback(obj, frame, what, trace_arg);
+    }
+
+    Py_RETURN_NONE;
 }
 
 static PyMethodDef FastTracer_methods[] = {
