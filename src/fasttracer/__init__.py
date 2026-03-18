@@ -30,8 +30,11 @@ class FastTracer:
     Uses double-buffered mmap'd regions and fork-based async flushing.
     """
 
-    def __init__(self, buffer_size=256 * 1024 * 1024, output_dir="/tmp/fasttracer"):
-        self._tracer = _FastTracer(buffer_size=buffer_size, output_dir=output_dir)
+    def __init__(self, buffer_size=256 * 1024 * 1024, output_dir="/tmp/fasttracer",
+                 rollover_size=0):
+        self._tracer = _FastTracer(buffer_size=buffer_size, output_dir=output_dir,
+                                    rollover_size=rollover_size)
+        self._output_dir = output_dir
 
     def start(self):
         """Start tracing."""

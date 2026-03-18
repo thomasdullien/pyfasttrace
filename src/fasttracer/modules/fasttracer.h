@@ -17,6 +17,7 @@
 #define FT_MAX_FUNC_ID     32767
 
 #define FT_FLAG_C_FUNCTION  (1 << 0)
+#define FT_FLAG_SYNTHETIC   (1 << 1)
 
 struct __attribute__((packed)) BinaryEvent {
     uint32_t ts_delta_us;   /* microseconds since buffer base_ts_ns         */
@@ -72,9 +73,12 @@ struct StringTable {
 
 /* ── Thread mapping ────────────────────────────────────────────────── */
 
+struct ThreadStack;  /* forward declaration */
+
 struct ThreadMapEntry {
     uint64_t os_tid;
     uint8_t  tid_idx;
+    struct ThreadStack* stack;  /* pointer to TLS stack for rollover iteration */
 };
 
 struct ThreadMap {
@@ -121,6 +125,11 @@ typedef struct {
     /* Flush */
     pid_t           flush_child;        /* PID of child doing flush, or 0    */
     char*           output_dir;         /* directory for .ftrc files         */
+
+    /* Rollover */
+    size_t          rollover_threshold; /* file size limit in bytes, 0=off   */
+    size_t          cumulative_bytes;   /* bytes written to current file     */
+    uint32_t        file_seq;           /* sequence number for file naming   */
 
     /* State */
     int             collecting;         /* nonzero while tracing is active   */

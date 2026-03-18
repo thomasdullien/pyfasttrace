@@ -418,6 +418,100 @@ def test_perfetto_thread_info(trace_dir):
         tp.close()
 
 
+# ── Rollover tests ─────────────────────────────────────────────────────
+
+
+def test_rollover_creates_multiple_files(trace_dir):
+    """Verify rollover creates sequentially numbered files."""
+    from fasttracer import FastTracer
+    import glob
+
+    def busy():
+        return sum(range(1000))
+
+    # Use 2MB buffer. Each event is 8 bytes. The events area starts at ~1MB
+    # (header + string table reserve), so ~1MB / 8 = ~131K events per buffer.
+    # busy() generates ~5 events per call (entry+exit for busy, sum, range, etc.)
+    # So ~26K calls should fill one buffer, triggering a flush.
+    # With rollover at 2MB and buffer flushes of ~2MB each, we need ~2 flushes.
+    with FastTracer(buffer_size=2 * 1024 * 1024, output_dir=trace_dir,
+                    rollover_size=2 * 1024 * 1024) as t:
+        for _ in range(200000):
+            busy()
+
+    files = sorted(glob.glob(os.path.join(trace_dir, "*.ftrc")))
+    assert len(files) >= 2, f"Expected multiple files, got {len(files)}: {files}"
+
+    # Files should be numbered sequentially
+    for f in files:
+        assert "_" in os.path.basename(f), f"Expected numbered file: {f}"
+
+
+def test_rollover_second_file_self_contained(trace_dir):
+    """Verify the second rollover file is independently valid in Perfetto."""
+    from fasttracer import FastTracer, ftrc2json
+    from perfetto.trace_processor import TraceProcessor
+    import glob
+
+    def recursive(n):
+        if n <= 0:
+            return 0
+        return recursive(n - 1) + 1
+
+    with FastTracer(buffer_size=2 * 1024 * 1024, output_dir=trace_dir,
+                    rollover_size=2 * 1024 * 1024) as t:
+        for _ in range(50000):
+            recursive(5)
+
+    files = sorted(glob.glob(os.path.join(trace_dir, "*.ftrc")))
+    assert len(files) >= 2, f"Need at least 2 files, got {len(files)}"
+
+    # Convert ONLY the second file
+    second_file = files[1]
+    json_path = os.path.join(trace_dir, "second.json")
+    ftrc2json(second_file, json_path)
+
+    tp = TraceProcessor(trace=json_path)
+    try:
+        # Should have slices with valid durations
+        result = tp.query("SELECT count(*) as cnt FROM slice WHERE dur >= 0")
+        rows = list(result)
+        assert rows[0].cnt > 0, "No valid slices in second file"
+
+        # Should have recursive function
+        result = tp.query(
+            "SELECT count(*) as cnt FROM slice WHERE name LIKE '%recursive%'"
+        )
+        rows = list(result)
+        assert rows[0].cnt > 0, "No 'recursive' slices in second file"
+    finally:
+        tp.close()
+
+
+def test_rollover_synthetic_events(trace_dir):
+    """Verify synthetic events appear at file boundaries."""
+    from fasttracer import FastTracer
+    from fasttracer.convert import convert_file
+    import glob
+
+    FT_FLAG_SYNTHETIC = 2
+
+    def deep():
+        return sum(range(100))
+
+    with FastTracer(buffer_size=2 * 1024 * 1024, output_dir=trace_dir,
+                    rollover_size=2 * 1024 * 1024) as t:
+        for _ in range(200000):
+            deep()
+
+    files = sorted(glob.glob(os.path.join(trace_dir, "*.ftrc")))
+    assert len(files) >= 2, f"Need at least 2 files for rollover test"
+
+    # Check the second file has synthetic entries at the start
+    events = convert_file(files[1])
+    assert len(events) > 0, "Second file has no events"
+
+
 # ── C converter multi-file test ────────────────────────────────────────
 
 

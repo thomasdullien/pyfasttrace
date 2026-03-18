@@ -17,6 +17,21 @@ static void ft_reset_child_after_fork(FastTracerObject* self);
 static uint16_t ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func);
 static struct ThreadStack* ft_get_thread_stack(FastTracerObject* self);
 static uint8_t ft_get_tid_idx(FastTracerObject* self);
+static void ft_rollover(FastTracerObject* self);
+
+/* ── File path helper ──────────────────────────────────────────────── */
+
+static void
+ft_make_output_path(FastTracerObject* self, char* buf, size_t buflen)
+{
+    if (self->rollover_threshold > 0) {
+        snprintf(buf, buflen, "%s/%d_%04u.ftrc",
+                 self->output_dir, (int)self->pid, self->file_seq);
+    } else {
+        snprintf(buf, buflen, "%s/%d.ftrc",
+                 self->output_dir, (int)self->pid);
+    }
+}
 
 /* ── Event recording ───────────────────────────────────────────────── */
 
@@ -400,7 +415,11 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
 static void
 ft_thread_stack_destructor(void* ptr)
 {
-    free(ptr);
+    /* Don't free — the thread_map holds a pointer to this stack for rollover
+       iteration. Just zero the depth so rollover won't emit synthetic events
+       for dead threads. The memory (512 bytes) is freed in FastTracer_dealloc. */
+    struct ThreadStack* stack = (struct ThreadStack*)ptr;
+    if (stack) stack->depth = 0;
 }
 
 static struct ThreadStack*
@@ -414,6 +433,12 @@ ft_get_thread_stack(FastTracerObject* self)
 
     stack->tid_idx = ft_get_tid_idx(self);
     pthread_setspecific(self->tls_key, stack);
+
+    /* Register in thread map so rollover can iterate all stacks */
+    if (stack->tid_idx < FT_MAX_THREADS) {
+        self->thread_map.entries[stack->tid_idx].stack = stack;
+    }
+
     return stack;
 }
 
@@ -454,6 +479,66 @@ ft_reset_child_after_fork(FastTracerObject* self)
     /* Reset thread map — only current thread survives */
     self->thread_map.count = 0;
     ft_get_tid_idx(self);  /* re-register current thread as idx 0 */
+}
+
+/* ── Synthetic event recording (for rollover) ──────────────────────── */
+
+static inline void
+ft_record_event_for_thread(FastTracerObject* self, uint16_t func_id,
+                           uint8_t flags, uint8_t tid_idx)
+{
+    int64_t now_ns = ft_get_monotonic_ns();
+    uint32_t delta_us = (uint32_t)((now_ns - self->base_ts_ns) / 1000);
+
+    size_t offset = atomic_fetch_add_explicit(
+        &self->write_offset, sizeof(struct BinaryEvent), memory_order_relaxed);
+
+    if (offset + sizeof(struct BinaryEvent) > self->buffer_size) {
+        return;  /* buffer full during synthetic emission — shouldn't happen */
+    }
+
+    struct BinaryEvent* event =
+        (struct BinaryEvent*)((char*)self->buffers[self->active_buf] + offset);
+    event->ts_delta_us = delta_us;
+    event->func_id = func_id;
+    event->tid_idx = tid_idx;
+    event->flags = flags;
+}
+
+static void
+ft_emit_synthetic_exits(FastTracerObject* self)
+{
+    for (int t = 0; t < self->thread_map.count; t++) {
+        struct ThreadStack* stack = self->thread_map.entries[t].stack;
+        if (!stack || stack->depth <= 0) continue;
+
+        uint8_t tid_idx = self->thread_map.entries[t].tid_idx;
+        /* Emit exits deepest-first */
+        for (int d = stack->depth - 1; d >= 0; d--) {
+            if (d < FT_MAX_STACK_DEPTH) {
+                ft_record_event_for_thread(self,
+                    stack->func_ids[d] | FT_EVENT_EXIT_BIT,
+                    FT_FLAG_SYNTHETIC, tid_idx);
+            }
+        }
+    }
+}
+
+static void
+ft_emit_synthetic_entries(FastTracerObject* self)
+{
+    for (int t = 0; t < self->thread_map.count; t++) {
+        struct ThreadStack* stack = self->thread_map.entries[t].stack;
+        if (!stack || stack->depth <= 0) continue;
+
+        uint8_t tid_idx = self->thread_map.entries[t].tid_idx;
+        /* Emit entries shallowest-first */
+        for (int d = 0; d < stack->depth && d < FT_MAX_STACK_DEPTH; d++) {
+            ft_record_event_for_thread(self,
+                stack->func_ids[d],
+                FT_FLAG_SYNTHETIC, tid_idx);
+        }
+    }
 }
 
 /* ── Flush mechanism ───────────────────────────────────────────────── */
@@ -509,15 +594,18 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     /* Total bytes to write: up to the end of events */
     size_t total_bytes = bytes_written;
 
+    /* Build output path */
+    char path[512];
+    ft_make_output_path(self, path, sizeof(path));
+
     if (sync) {
-        /* Synchronous flush (called from stop()) */
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%d.ftrc", self->output_dir, (int)self->pid);
+        /* Synchronous flush (called from stop() or rollover) */
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
             write(fd, self->buffers[buf_to_flush], total_bytes);
             close(fd);
         }
+        self->cumulative_bytes += total_bytes;
         return 0;
     }
 
@@ -525,8 +613,6 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     pid_t child = fork();
     if (child == 0) {
         /* Child process: write and exit */
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%d.ftrc", self->output_dir, (int)self->pid);
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
             /* Single sequential write */
@@ -545,7 +631,50 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     }
     /* If fork fails, we lose the buffer. Acceptable for a tracer. */
 
+    self->cumulative_bytes += total_bytes;
+
+    /* Check rollover threshold */
+    if (self->rollover_threshold > 0 &&
+        self->cumulative_bytes >= self->rollover_threshold) {
+        ft_rollover(self);
+    }
+
     return 0;
+}
+
+/* ── Rollover mechanism ────────────────────────────────────────────── */
+
+static void
+ft_rollover(FastTracerObject* self)
+{
+    int was_collecting = self->collecting;
+    self->collecting = 0;
+
+    /* Wait for any in-flight flush child */
+    if (self->flush_child > 0) {
+        waitpid(self->flush_child, NULL, 0);
+        self->flush_child = 0;
+    }
+
+    /* Emit synthetic exits for all open frames into active buffer */
+    ft_emit_synthetic_exits(self);
+
+    /* Synchronous flush — final chunk to current file */
+    ft_flush_buffer(self, 1);
+
+    /* Start new file */
+    self->file_seq++;
+    self->cumulative_bytes = 0;
+
+    /* Reset timing for new file */
+    self->base_ts_ns = ft_get_monotonic_ns();
+    atomic_store_explicit(&self->write_offset, self->events_start, memory_order_relaxed);
+
+    /* Emit synthetic entries to re-open the stack in the new file */
+    ft_emit_synthetic_entries(self);
+
+    /* Resume tracing */
+    self->collecting = was_collecting;
 }
 
 /* ── Python type methods ───────────────────────────────────────────── */
@@ -579,12 +708,13 @@ FastTracer_new(PyTypeObject* type, PyObject* Py_UNUSED(args), PyObject* Py_UNUSE
 static int
 FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
 {
-    static char* kwlist[] = {"buffer_size", "output_dir", NULL};
+    static char* kwlist[] = {"buffer_size", "output_dir", "rollover_size", NULL};
     Py_ssize_t buffer_size = 256 * 1024 * 1024;  /* 256MB default */
     const char* output_dir = "/tmp/fasttracer";
+    Py_ssize_t rollover_size = 0;  /* 0 = disabled */
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ns", kwlist,
-                                      &buffer_size, &output_dir)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|nsn", kwlist,
+                                      &buffer_size, &output_dir, &rollover_size)) {
         return -1;
     }
 
@@ -636,6 +766,11 @@ FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
         return -1;
     }
 
+    /* Rollover */
+    self->rollover_threshold = (size_t)rollover_size;
+    self->cumulative_bytes = 0;
+    self->file_seq = 0;
+
     /* Thread-local storage */
     if (pthread_key_create(&self->tls_key, ft_thread_stack_destructor) != 0) {
         PyErr_SetFromErrno(PyExc_OSError);
@@ -662,10 +797,13 @@ FastTracer_dealloc(FastTracerObject* self)
     intern_free(&self->intern);
     string_table_free(&self->strings);
 
-    /* Release all interned Python objects.
-       We Py_INCREF'd each key on intern — we should release them.
-       For simplicity and because we're deallocating, we skip this.
-       The objects will be cleaned up when the interpreter shuts down. */
+    /* Free all thread stacks (destructor only zeroed depth, didn't free) */
+    for (int i = 0; i < self->thread_map.count; i++) {
+        if (self->thread_map.entries[i].stack) {
+            free(self->thread_map.entries[i].stack);
+            self->thread_map.entries[i].stack = NULL;
+        }
+    }
 
     free(self->output_dir);
 
@@ -740,7 +878,7 @@ static PyObject*
 FastTracer_get_output_path(FastTracerObject* self, PyObject* Py_UNUSED(unused))
 {
     char path[512];
-    snprintf(path, sizeof(path), "%s/%d.ftrc", self->output_dir, (int)self->pid);
+    ft_make_output_path(self, path, sizeof(path));
     return PyUnicode_FromString(path);
 }
 
