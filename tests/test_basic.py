@@ -512,6 +512,86 @@ def test_rollover_synthetic_events(trace_dir):
     assert len(events) > 0, "Second file has no events"
 
 
+# ── perf-viz-merge integration tests ───────────────────────────────────
+
+PERF_VIZ_MERGE = "/home/thomasdullien/sources/perftrace/perf-viz-merge"
+
+
+@pytest.mark.skipif(
+    not os.path.isfile(PERF_VIZ_MERGE),
+    reason="perf-viz-merge binary not found"
+)
+def test_perf_viz_merge_reads_output(trace_dir):
+    """Verify perf-viz-merge can parse our JSON output."""
+    import subprocess
+    from fasttracer import FastTracer, ftrc2json
+
+    def fib(n):
+        if n <= 1:
+            return 1
+        return fib(n - 1) + fib(n - 2)
+
+    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+        fib(15)
+
+    json_path = os.path.join(trace_dir, "trace.json")
+    ftrc2json(t.output_path, json_path)
+
+    output_path = os.path.join(trace_dir, "merged.perfetto-trace")
+    result = subprocess.run(
+        [PERF_VIZ_MERGE, "--viz", json_path, "-o", output_path, "-v"],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"perf-viz-merge failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert os.path.exists(output_path), "No output file produced"
+    assert os.path.getsize(output_path) > 0, "Output file is empty"
+
+    # Check that it reported reading our events
+    output = result.stdout + result.stderr
+    assert "VizTracer events" in output, f"Unexpected output: {output}"
+
+
+@pytest.mark.skipif(
+    not os.path.isfile(PERF_VIZ_MERGE),
+    reason="perf-viz-merge binary not found"
+)
+def test_perf_viz_merge_rollover_file(trace_dir):
+    """Verify perf-viz-merge can parse a single rollover file (with synthetic events)."""
+    import glob
+    import subprocess
+    from fasttracer import FastTracer, ftrc2json
+
+    def work():
+        return sum(range(1000))
+
+    with FastTracer(buffer_size=2 * 1024 * 1024, output_dir=trace_dir,
+                    rollover_size=2 * 1024 * 1024) as t:
+        for _ in range(200000):
+            work()
+
+    files = sorted(glob.glob(os.path.join(trace_dir, "*.ftrc")))
+    assert len(files) >= 2, f"Need rollover files, got {len(files)}"
+
+    # Convert the second file only
+    json_path = os.path.join(trace_dir, "second.json")
+    ftrc2json(files[1], json_path)
+
+    output_path = os.path.join(trace_dir, "merged.perfetto-trace")
+    result = subprocess.run(
+        [PERF_VIZ_MERGE, "--viz", json_path, "-o", output_path, "-v"],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"perf-viz-merge failed on rollover file:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert os.path.getsize(output_path) > 0, "Output file is empty"
+
+
 # ── C converter multi-file test ────────────────────────────────────────
 
 
