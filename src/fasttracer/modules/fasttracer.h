@@ -58,6 +58,7 @@ struct __attribute__((packed)) BufferHeader {
 
 struct InternEntry {
     void*    key;          /* PyCodeObject* or PyCFunctionObject* pointer */
+    uint32_t tag;          /* identity tag to detect pointer reuse        */
     uint32_t func_id;      /* sequential ID, 1-based                     */
 };
 
@@ -161,10 +162,11 @@ ft_get_monotonic_ns(void)
 
 int  intern_init(struct InternTable* table);
 void intern_free(struct InternTable* table);
-/* Returns existing func_id, or 0 if not found */
-uint32_t intern_lookup(struct InternTable* table, void* key);
+/* Returns existing func_id, or 0 if not found.
+ * tag is a lightweight identity check to detect pointer reuse. */
+uint32_t intern_lookup(struct InternTable* table, void* key, uint32_t tag);
 /* Insert key→func_id. Returns 0 on success, -1 on failure. */
-int  intern_insert(struct InternTable* table, void* key, uint32_t func_id);
+int  intern_insert(struct InternTable* table, void* key, uint32_t tag, uint32_t func_id);
 
 int  string_table_init(struct StringTable* st);
 void string_table_free(struct StringTable* st);

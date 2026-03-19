@@ -35,7 +35,7 @@ hash_ptr(void* p, uint32_t mask)
 }
 
 uint32_t
-intern_lookup(struct InternTable* table, void* key)
+intern_lookup(struct InternTable* table, void* key, uint32_t tag)
 {
     uint32_t mask = table->capacity - 1;
     uint32_t idx = hash_ptr(key, mask);
@@ -43,7 +43,8 @@ intern_lookup(struct InternTable* table, void* key)
     for (;;) {
         struct InternEntry* e = &table->entries[idx];
         if (e->key == NULL) return 0;        /* empty slot, not found */
-        if (e->key == key) return e->func_id;
+        if (e->key == key && e->tag == tag) return e->func_id;
+        if (e->key == key && e->tag != tag) return 0;  /* pointer reused */
         idx = (idx + 1) & mask;
     }
 }
@@ -73,7 +74,7 @@ intern_grow(struct InternTable* table)
 }
 
 int
-intern_insert(struct InternTable* table, void* key, uint32_t func_id)
+intern_insert(struct InternTable* table, void* key, uint32_t tag, uint32_t func_id)
 {
     /* Grow at 70% load */
     if (table->count * 10 >= table->capacity * 7) {
@@ -87,12 +88,19 @@ intern_insert(struct InternTable* table, void* key, uint32_t func_id)
         struct InternEntry* e = &table->entries[idx];
         if (e->key == NULL) {
             e->key = key;
+            e->tag = tag;
             e->func_id = func_id;
             table->count++;
             return 0;
         }
-        if (e->key == key) {
+        if (e->key == key && e->tag == tag) {
             /* already exists */
+            return 0;
+        }
+        if (e->key == key && e->tag != tag) {
+            /* pointer reused — overwrite with new identity */
+            e->tag = tag;
+            e->func_id = func_id;
             return 0;
         }
         idx = (idx + 1) & mask;

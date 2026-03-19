@@ -370,13 +370,33 @@ ft_disable_monitoring(FastTracerObject* self)
 
 /* ── String interning ──────────────────────────────────────────────── */
 
+/* Compute a lightweight identity tag for a Python object.
+ * This is used alongside the pointer to detect address reuse:
+ *   - PyCodeObject:    co_firstlineno (unique per function definition)
+ *   - PyCFunctionObject: hash of ml_name C string pointer (stable for
+ *     the lifetime of the extension module)
+ *   - Other:           0 (no tag — rare path, accept potential stale hit)
+ */
+static inline uint32_t
+ft_identity_tag(PyObject* func_obj, int is_c_func)
+{
+    if (!is_c_func && PyCode_Check(func_obj)) {
+        return (uint32_t)((PyCodeObject*)func_obj)->co_firstlineno;
+    } else if (PyCFunction_Check(func_obj)) {
+        uintptr_t p = (uintptr_t)((PyCFunctionObject*)func_obj)->m_ml->ml_name;
+        return (uint32_t)(p ^ (p >> 16));
+    }
+    return 0;
+}
+
 static uint32_t
 ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
 {
-    uint32_t fid = intern_lookup(&self->intern, (void*)func_obj);
+    uint32_t tag = ft_identity_tag(func_obj, is_c_func);
+    uint32_t fid = intern_lookup(&self->intern, (void*)func_obj, tag);
     if (fid != 0) return fid;
 
-    /* Cold path: first time seeing this function */
+    /* Cold path: first time seeing this function (or pointer was reused) */
     if (self->intern.count >= FT_MAX_FUNC_ID) return 0;
 
     fid = (uint32_t)(self->intern.count + 1);
@@ -434,10 +454,11 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
         return 0;
     }
 
-    /* Keep the Python object alive so the pointer stays valid as key */
-    Py_INCREF(func_obj);
-
-    if (intern_insert(&self->intern, (void*)func_obj, fid) < 0) {
+    /* No Py_INCREF — we do not hold references to Python objects.
+     * The intern table uses (pointer, tag) for lookup.  If the object is
+     * freed and the address reused, the tag mismatch triggers re-interning
+     * with the correct name. */
+    if (intern_insert(&self->intern, (void*)func_obj, tag, fid) < 0) {
         return 0;
     }
 
