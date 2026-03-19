@@ -619,7 +619,16 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     /* Async flush via fork */
     pid_t child = fork();
     if (child == 0) {
-        /* Child process: write and exit */
+        /* Child process: write and exit.
+         * Close NVIDIA GPU file descriptors inherited from the parent
+         * to prevent the driver from counting our (soon-dead) process
+         * against the parent's GPU memory budget. */
+        for (int nfd = 3; nfd < 1024; nfd++) {
+            /* Close all fds except stdin/stdout/stderr.
+             * This is aggressive but safe — the child only needs to
+             * write to a new fd it opens below. */
+            close(nfd);
+        }
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
             /* Single sequential write */
