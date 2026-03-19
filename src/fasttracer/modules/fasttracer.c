@@ -6,7 +6,13 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
 #include <errno.h>
+
+/* gettid() wrapper — returns Linux kernel TID (not pthread_t) */
+static inline pid_t ft_gettid(void) {
+    return (pid_t)syscall(SYS_gettid);
+}
 
 #include "fasttracer.h"
 
@@ -446,7 +452,7 @@ ft_get_thread_stack(FastTracerObject* self)
 static uint8_t
 ft_get_tid_idx(FastTracerObject* self)
 {
-    uint64_t os_tid = (uint64_t)pthread_self();
+    uint64_t os_tid = (uint64_t)ft_gettid();  /* Linux kernel TID, not pthread_t */
 
     /* Linear scan — max 256 entries, typically < 10 */
     for (int i = 0; i < self->thread_map.count; i++) {
