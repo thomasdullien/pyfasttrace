@@ -78,24 +78,23 @@ def test_converter(trace_dir):
     events = convert_file(t.output_path)
     assert len(events) > 0, "No events converted"
 
-    # Check that we have both B and E events
+    # Check that we have X (complete) events
     phases = {e["ph"] for e in events}
-    assert "B" in phases, "No entry events found"
-    assert "E" in phases, "No exit events found"
+    assert "X" in phases, "No complete events found"
 
     # Check that events have expected fields
     for e in events:
         assert "ts" in e
+        assert "dur" in e
         assert "pid" in e
         assert "tid" in e
         assert "name" in e
 
-    # Check that timestamps are monotonically non-decreasing
-    timestamps = [e["ts"] for e in events]
-    for i in range(1, len(timestamps)):
-        assert timestamps[i] >= timestamps[i - 1], (
-            f"Non-monotonic timestamp at index {i}: {timestamps[i-1]} > {timestamps[i]}"
-        )
+    # With "X" events, timestamps are ordered by completion (inner calls
+    # complete before outer), so start timestamps are not monotonic.
+    # Just verify all durations are non-negative.
+    for e in events:
+        assert e["dur"] >= 0, f"Negative duration: {e}"
 
 
 def test_nested_functions(trace_dir):
@@ -144,10 +143,8 @@ def test_exception_handling(trace_dir):
 
     # Filter to only thrower/catcher events (exclude tracer shutdown noise)
     relevant = [e for e in events if "thrower" in e["name"] or "catcher" in e["name"]]
-    entries = sum(1 for e in relevant if e["ph"] == "B")
-    exits = sum(1 for e in relevant if e["ph"] == "E")
-    assert entries == exits, f"Unbalanced: {entries} entries, {exits} exits"
-    assert entries == 20, f"Expected 20 entries (10×catcher + 10×thrower), got {entries}"
+    assert all(e["ph"] == "X" for e in relevant), "Expected all X events"
+    assert len(relevant) == 20, f"Expected 20 events (10×catcher + 10×thrower), got {len(relevant)}"
 
 
 # ── C converter (ftrc2json) tests ──────────────────────────────────────
@@ -177,8 +174,8 @@ def test_c_converter_basic(trace_dir):
     assert len(all_events) > 0, "No events in JSON output"
 
     # Filter to trace events (not metadata)
-    events = [e for e in all_events if e["ph"] in ("B", "E")]
-    assert len(events) > 0, "No B/E events in JSON output"
+    events = [e for e in all_events if e["ph"] == "X"]
+    assert len(events) > 0, "No X events in JSON output"
 
     # Check structure of trace events
     for e in events:
@@ -186,12 +183,9 @@ def test_c_converter_basic(trace_dir):
         assert "pid" in e
         assert "tid" in e
         assert "ts" in e
+        assert "dur" in e
         assert "name" in e
-
-    # Should have both B and E phases
-    phases = {e["ph"] for e in events}
-    assert "B" in phases
-    assert "E" in phases
+        assert e["cat"] == "FEE"
 
 
 def test_c_converter_matches_python(trace_dir):
@@ -216,7 +210,7 @@ def test_c_converter_matches_python(trace_dir):
         c_trace = json.load(f)
 
     # Filter out metadata events (ph=M) from C output for comparison
-    c_events = [e for e in c_trace["traceEvents"] if e["ph"] in ("B", "E")]
+    c_events = [e for e in c_trace["traceEvents"] if e["ph"] == "X"]
 
     assert len(py_events) == len(c_events), (
         f"Event count mismatch: Python={len(py_events)}, C={len(c_events)}"
@@ -232,6 +226,9 @@ def test_c_converter_matches_python(trace_dir):
         # Timestamps may differ slightly due to float precision
         assert abs(py_ev["ts"] - c_ev["ts"]) < 1.0, (
             f"Timestamp mismatch at {i}: {py_ev['ts']} vs {c_ev['ts']}"
+        )
+        assert abs(py_ev["dur"] - c_ev["dur"]) < 1.0, (
+            f"Duration mismatch at {i}: {py_ev['dur']} vs {c_ev['dur']}"
         )
 
 
@@ -257,7 +254,7 @@ def test_c_converter_nested(trace_dir):
     with open(json_path) as f:
         trace = json.load(f)
 
-    events = [e for e in trace["traceEvents"] if e["ph"] in ("B", "E")]
+    events = [e for e in trace["traceEvents"] if e["ph"] == "X"]
     names = [e["name"] for e in events]
 
     assert any("outer" in n for n in names)
@@ -288,12 +285,9 @@ def test_c_converter_exceptions(trace_dir):
     with open(json_path) as f:
         trace = json.load(f)
 
-    events = [e for e in trace["traceEvents"] if e["ph"] in ("B", "E")]
+    events = [e for e in trace["traceEvents"] if e["ph"] == "X"]
     relevant = [e for e in events if "thrower" in e["name"] or "catcher" in e["name"]]
-    entries = sum(1 for e in relevant if e["ph"] == "B")
-    exits = sum(1 for e in relevant if e["ph"] == "E")
-    assert entries == exits, f"Unbalanced: {entries} entries, {exits} exits"
-    assert entries == 20
+    assert len(relevant) == 20, f"Expected 20 events (10×catcher + 10×thrower), got {len(relevant)}"
 
 
 # ── Perfetto integration tests ─────────────────────────────────────────
@@ -624,7 +618,7 @@ def test_c_converter_multiple_files(trace_dir):
     with open(json_path) as f:
         trace = json.load(f)
 
-    events = [e for e in trace["traceEvents"] if e["ph"] in ("B", "E")]
+    events = [e for e in trace["traceEvents"] if e["ph"] == "X"]
     names = [e["name"] for e in events]
 
     assert any("alpha" in n for n in names), "Missing alpha events"

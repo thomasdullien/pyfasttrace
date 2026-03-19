@@ -88,6 +88,23 @@ parse_string_table(const char* base, uint32_t st_offset, uint16_t num_strings,
     return strings;
 }
 
+/* ── Per-thread stack for B→X conversion ──────────────────────────── */
+
+#define MAX_STACK_DEPTH 4096
+
+struct StackEntry {
+    double   ts;
+    uint16_t func_id;
+    uint8_t  flags;
+};
+
+struct ThreadStack {
+    struct StackEntry entries[MAX_STACK_DEPTH];
+    int depth;
+};
+
+static struct ThreadStack thread_stacks[FT_MAX_THREADS];
+
 /* ── Escape a string for JSON output ───────────────────────────────── */
 
 static void
@@ -183,22 +200,34 @@ process_file(const char* path, FILE* out, int* first_event)
 
         uint16_t num_strings = hdr->num_strings;
 
+        /* Emit process_name metadata (viztracer compat) */
+        if (!*first_event) {
+            fputc(',', out);
+        }
+        *first_event = 0;
+        fprintf(out,
+            "{\"ph\":\"M\",\"pid\":%u,\"tid\":%lu,"
+            "\"name\":\"process_name\","
+            "\"args\":{\"name\":\"MainProcess\"}}",
+            hdr->pid,
+            (unsigned long)(hdr->num_threads > 0 ? hdr->thread_table[0] : 0));
+
         /* Emit thread name metadata events */
         for (uint8_t i = 0; i < hdr->num_threads; i++) {
-            if (!*first_event) {
-                fputc(',', out);
-            }
-            *first_event = 0;
+            fputc(',', out);
             fprintf(out,
                 "{\"ph\":\"M\",\"pid\":%u,\"tid\":%lu,"
                 "\"name\":\"thread_name\","
-                "\"args\":{\"name\":\"Thread %lu\"}}",
+                "\"args\":{\"name\":\"%s\"}}",
                 hdr->pid,
                 (unsigned long)hdr->thread_table[i],
-                (unsigned long)hdr->thread_table[i]);
+                i == 0 ? "MainThread" : "Thread");
         }
 
-        /* Walk events */
+        /* Reset per-thread stacks for this chunk */
+        memset(thread_stacks, 0, sizeof(thread_stacks));
+
+        /* Walk events, converting B/E pairs to viztracer-compatible "X" events */
         const struct BinaryEvent* events =
             (const struct BinaryEvent*)(data + offset + hdr->events_offset);
 
@@ -218,35 +247,52 @@ process_file(const char* path, FILE* out, int* first_event)
                 os_tid = hdr->thread_table[ev->tid_idx];
             }
 
-            /* Resolve function name */
-            const char* name;
-            uint16_t name_len;
-            if (fid > 0 && fid <= num_strings) {
-                name = strings[fid].data;
-                name_len = strings[fid].len;
+            uint8_t tidx = ev->tid_idx;
+
+            if (!is_exit) {
+                /* Push entry onto per-thread stack */
+                struct ThreadStack* ts = &thread_stacks[tidx];
+                if (ts->depth < MAX_STACK_DEPTH) {
+                    ts->entries[ts->depth].ts = abs_ts_us;
+                    ts->entries[ts->depth].func_id = fid;
+                    ts->entries[ts->depth].flags = ev->flags;
+                    ts->depth++;
+                }
             } else {
-                name = "<unknown>";
-                name_len = 9;
+                /* Pop matching entry, emit "X" event */
+                struct ThreadStack* ts = &thread_stacks[tidx];
+                if (ts->depth <= 0) continue;
+                ts->depth--;
+
+                struct StackEntry* entry = &ts->entries[ts->depth];
+                double dur = abs_ts_us - entry->ts;
+
+                /* Resolve function name from the entry's func_id */
+                const char* name;
+                uint16_t name_len;
+                if (entry->func_id > 0 && entry->func_id <= num_strings) {
+                    name = strings[entry->func_id].data;
+                    name_len = strings[entry->func_id].len;
+                } else {
+                    name = "<unknown>";
+                    name_len = 9;
+                }
+
+                if (!*first_event) {
+                    fputc(',', out);
+                }
+                *first_event = 0;
+
+                /* Emit viztracer-compatible "X" event */
+                fprintf(out, "{\"pid\":%u,\"tid\":%lu,\"ts\":%.3f,\"ph\":\"X\",\"dur\":%.3f,\"name\":",
+                        hdr->pid,
+                        (unsigned long)os_tid,
+                        entry->ts,
+                        dur);
+                fwrite_json_string(out, name, name_len);
+                fputs(",\"cat\":\"FEE\"", out);
+                fputc('}', out);
             }
-
-            if (!*first_event) {
-                fputc(',', out);
-            }
-            *first_event = 0;
-
-            /* Emit JSON event */
-            fprintf(out, "{\"ph\":\"%c\",\"pid\":%u,\"tid\":%lu,\"ts\":%.3f,\"name\":",
-                    is_exit ? 'E' : 'B',
-                    hdr->pid,
-                    (unsigned long)os_tid,
-                    abs_ts_us);
-            fwrite_json_string(out, name, name_len);
-
-            if (ev->flags & FT_FLAG_C_FUNCTION) {
-                fputs(",\"cat\":\"c_function\"", out);
-            }
-
-            fputc('}', out);
         }
 
         total_events += hdr->num_events;
@@ -326,7 +372,8 @@ main(int argc, char** argv)
         }
     }
 
-    fputs("]}\n", out);
+    fputs("],\"viztracer_metadata\":{\"version\":\"0.0.1\",\"overflow\":false},"
+          "\"file_info\":{\"files\":{},\"functions\":{}}}\n", out);
 
     if (output_path) {
         fclose(out);

@@ -85,8 +85,9 @@ def convert_chunk(data, offset=0):
     # Read string table
     strings = read_string_table(data, offset + st_offset, num_strings)
 
-    # Read events
+    # Read events, converting B/E pairs into viztracer-compatible "X" events
     events = []
+    thread_stacks = {}  # tid -> [(name, ts, flags), ...]
     ev_abs_offset = offset + ev_offset
     for i in range(num_events):
         eoff = ev_abs_offset + i * EVENT_SIZE
@@ -109,18 +110,25 @@ def convert_chunk(data, offset=0):
         # Map thread ID
         os_tid = threads[tid_idx] if tid_idx < len(threads) else tid_idx
 
-        event = {
-            "ph": "E" if is_exit else "B",
-            "name": name,
-            "ts": abs_ts_us,
-            "pid": pid,
-            "tid": os_tid,
-        }
-
-        if flags & FLAG_C_FUNCTION:
-            event["cat"] = "c_function"
-
-        events.append(event)
+        if not is_exit:
+            # Push entry onto per-thread stack
+            stack = thread_stacks.setdefault(os_tid, [])
+            stack.append((name, abs_ts_us, flags))
+        else:
+            # Pop matching entry, emit "X" event
+            stack = thread_stacks.get(os_tid)
+            if stack:
+                entry_name, entry_ts, entry_flags = stack.pop()
+                event = {
+                    "ph": "X",
+                    "name": entry_name,
+                    "ts": entry_ts,
+                    "dur": abs_ts_us - entry_ts,
+                    "pid": pid,
+                    "tid": os_tid,
+                    "cat": "FEE",
+                }
+                events.append(event)
 
     # Next chunk starts after our events
     next_offset = ev_abs_offset + num_events * EVENT_SIZE
@@ -156,7 +164,11 @@ def main():
     # Sort by timestamp
     all_events.sort(key=lambda e: e["ts"])
 
-    trace = {"traceEvents": all_events}
+    trace = {
+        "traceEvents": all_events,
+        "viztracer_metadata": {"version": "0.0.1", "overflow": False},
+        "file_info": {"files": {}, "functions": {}},
+    }
 
     with open(args.output, "w") as f:
         json.dump(trace, f)
