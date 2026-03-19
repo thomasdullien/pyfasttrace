@@ -20,7 +20,7 @@ static inline pid_t ft_gettid(void) {
 
 static int  ft_flush_buffer(FastTracerObject* self, int sync);
 static void ft_reset_child_after_fork(FastTracerObject* self);
-static uint16_t ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func);
+static uint32_t ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func);
 static struct ThreadStack* ft_get_thread_stack(FastTracerObject* self);
 static uint8_t ft_get_tid_idx(FastTracerObject* self);
 static void ft_rollover(FastTracerObject* self);
@@ -43,7 +43,7 @@ ft_make_output_path(FastTracerObject* self, char* buf, size_t buflen)
 /* ── Event recording ───────────────────────────────────────────────── */
 
 static inline void
-ft_record_event(FastTracerObject* self, uint16_t func_id, uint8_t flags)
+ft_record_event(FastTracerObject* self, uint32_t func_id, uint8_t flags)
 {
     /* Fork detection */
     pid_t current_pid = getpid();
@@ -99,7 +99,7 @@ ft_profile_callback(PyObject* obj, PyFrameObject* frame, int what, PyObject* arg
     switch (what) {
     case PyTrace_CALL: {
         PyCodeObject* code = PyFrame_GetCode(frame);
-        uint16_t fid = ft_intern_function(self, (PyObject*)code, 0);
+        uint32_t fid = ft_intern_function(self, (PyObject*)code, 0);
         Py_DECREF(code);
         if (fid == 0) return 0;  /* intern table full */
         ft_record_event(self, fid, 0);
@@ -111,18 +111,18 @@ ft_profile_callback(PyObject* obj, PyFrameObject* frame, int what, PyObject* arg
     }
     case PyTrace_RETURN: {
         stack->depth--;
-        uint16_t fid = 0;
+        uint32_t fid = 0;
         if (stack->depth >= 0 && stack->depth < FT_MAX_STACK_DEPTH) {
             fid = stack->func_ids[stack->depth];
         }
         if (stack->depth < 0) stack->depth = 0;
         if (fid != 0) {
-            ft_record_event(self, fid | FT_EVENT_EXIT_BIT, 0);
+            ft_record_event(self, fid, FT_FLAG_EXIT);
         }
         break;
     }
     case PyTrace_C_CALL: {
-        uint16_t fid = ft_intern_function(self, arg, 1);
+        uint32_t fid = ft_intern_function(self, arg, 1);
         if (fid == 0) return 0;
         ft_record_event(self, fid, FT_FLAG_C_FUNCTION);
         if (stack->depth < FT_MAX_STACK_DEPTH) {
@@ -134,13 +134,13 @@ ft_profile_callback(PyObject* obj, PyFrameObject* frame, int what, PyObject* arg
     case PyTrace_C_RETURN:
     case PyTrace_C_EXCEPTION: {
         stack->depth--;
-        uint16_t fid = 0;
+        uint32_t fid = 0;
         if (stack->depth >= 0 && stack->depth < FT_MAX_STACK_DEPTH) {
             fid = stack->func_ids[stack->depth];
         }
         if (stack->depth < 0) stack->depth = 0;
         if (fid != 0) {
-            ft_record_event(self, fid | FT_EVENT_EXIT_BIT, FT_FLAG_C_FUNCTION);
+            ft_record_event(self, fid, FT_FLAG_EXIT | FT_FLAG_C_FUNCTION);
         }
         break;
     }
@@ -167,7 +167,7 @@ ft_mon_pystart(PyObject* obj, PyObject* const* args, Py_ssize_t nargs)
     struct ThreadStack* stack = ft_get_thread_stack(self);
     if (!stack) Py_RETURN_NONE;
 
-    uint16_t fid = ft_intern_function(self, (PyObject*)code, 0);
+    uint32_t fid = ft_intern_function(self, (PyObject*)code, 0);
     if (fid == 0) Py_RETURN_NONE;
 
     ft_record_event(self, fid, 0);
@@ -189,13 +189,13 @@ ft_mon_pyreturn(PyObject* obj, PyObject* const* args, Py_ssize_t nargs)
     if (!stack) Py_RETURN_NONE;
 
     stack->depth--;
-    uint16_t fid = 0;
+    uint32_t fid = 0;
     if (stack->depth >= 0 && stack->depth < FT_MAX_STACK_DEPTH) {
         fid = stack->func_ids[stack->depth];
     }
     if (stack->depth < 0) stack->depth = 0;
     if (fid != 0) {
-        ft_record_event(self, fid | FT_EVENT_EXIT_BIT, 0);
+        ft_record_event(self, fid, FT_FLAG_EXIT);
     }
 
     Py_RETURN_NONE;
@@ -212,7 +212,7 @@ ft_mon_ccall(PyObject* obj, PyObject* const* args, Py_ssize_t nargs)
     struct ThreadStack* stack = ft_get_thread_stack(self);
     if (!stack) Py_RETURN_NONE;
 
-    uint16_t fid = ft_intern_function(self, callable, 1);
+    uint32_t fid = ft_intern_function(self, callable, 1);
     if (fid == 0) Py_RETURN_NONE;
 
     ft_record_event(self, fid, FT_FLAG_C_FUNCTION);
@@ -234,13 +234,13 @@ ft_mon_creturn(PyObject* obj, PyObject* const* args, Py_ssize_t nargs)
     if (!stack) Py_RETURN_NONE;
 
     stack->depth--;
-    uint16_t fid = 0;
+    uint32_t fid = 0;
     if (stack->depth >= 0 && stack->depth < FT_MAX_STACK_DEPTH) {
         fid = stack->func_ids[stack->depth];
     }
     if (stack->depth < 0) stack->depth = 0;
     if (fid != 0) {
-        ft_record_event(self, fid | FT_EVENT_EXIT_BIT, FT_FLAG_C_FUNCTION);
+        ft_record_event(self, fid, FT_FLAG_EXIT | FT_FLAG_C_FUNCTION);
     }
 
     Py_RETURN_NONE;
@@ -343,16 +343,16 @@ ft_disable_monitoring(FastTracerObject* self)
 
 /* ── String interning ──────────────────────────────────────────────── */
 
-static uint16_t
+static uint32_t
 ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
 {
-    uint16_t fid = intern_lookup(&self->intern, (void*)func_obj);
+    uint32_t fid = intern_lookup(&self->intern, (void*)func_obj);
     if (fid != 0) return fid;
 
     /* Cold path: first time seeing this function */
     if (self->intern.count >= FT_MAX_FUNC_ID) return 0;
 
-    fid = (uint16_t)(self->intern.count + 1);
+    fid = (uint32_t)(self->intern.count + 1);
 
     char namebuf[512];
     int namelen = 0;
@@ -403,7 +403,7 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
     if (namelen >= (int)sizeof(namebuf)) namelen = sizeof(namebuf) - 1;
 
     /* Append to string table */
-    if (string_table_append(&self->strings, namebuf, (uint16_t)namelen) < 0) {
+    if (string_table_append(&self->strings, namebuf, (uint32_t)namelen) < 0) {
         return 0;
     }
 
@@ -491,7 +491,7 @@ ft_reset_child_after_fork(FastTracerObject* self)
 /* ── Synthetic event recording (for rollover) ──────────────────────── */
 
 static inline void
-ft_record_event_for_thread(FastTracerObject* self, uint16_t func_id,
+ft_record_event_for_thread(FastTracerObject* self, uint32_t func_id,
                            uint8_t flags, uint8_t tid_idx)
 {
     int64_t now_ns = ft_get_monotonic_ns();
@@ -524,8 +524,8 @@ ft_emit_synthetic_exits(FastTracerObject* self)
         for (int d = stack->depth - 1; d >= 0; d--) {
             if (d < FT_MAX_STACK_DEPTH) {
                 ft_record_event_for_thread(self,
-                    stack->func_ids[d] | FT_EVENT_EXIT_BIT,
-                    FT_FLAG_SYNTHETIC, tid_idx);
+                    stack->func_ids[d],
+                    FT_FLAG_SYNTHETIC | FT_FLAG_EXIT, tid_idx);
             }
         }
     }
@@ -571,7 +571,7 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     hdr->pid = (uint32_t)self->pid;
     hdr->base_ts_ns = self->base_ts_ns;
     hdr->num_events = num_events;
-    hdr->num_strings = (uint16_t)self->intern.count;
+    hdr->num_strings = (uint32_t)self->intern.count;
     hdr->num_threads = self->thread_map.count;
     hdr->string_table_offset = (uint32_t)sizeof(struct BufferHeader);
     hdr->events_offset = (uint32_t)self->events_start;
@@ -726,8 +726,8 @@ FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
     }
 
     /* Compute layout: header + string table space + events */
-    /* Reserve 1MB for string table (enough for ~10K functions at ~100 chars) */
-    size_t string_table_reserve = 1024 * 1024;
+    /* Reserve 16MB for string table (enough for ~160K functions at ~100 chars) */
+    size_t string_table_reserve = 16 * 1024 * 1024;
     self->events_start = sizeof(struct BufferHeader) + string_table_reserve;
     /* Align to 8 bytes */
     self->events_start = (self->events_start + 7) & ~(size_t)7;

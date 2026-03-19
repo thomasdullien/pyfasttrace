@@ -34,7 +34,7 @@ hash_ptr(void* p, uint32_t mask)
     return (uint32_t)v & mask;
 }
 
-uint16_t
+uint32_t
 intern_lookup(struct InternTable* table, void* key)
 {
     uint32_t mask = table->capacity - 1;
@@ -73,7 +73,7 @@ intern_grow(struct InternTable* table)
 }
 
 int
-intern_insert(struct InternTable* table, void* key, uint16_t func_id)
+intern_insert(struct InternTable* table, void* key, uint32_t func_id)
 {
     /* Grow at 70% load */
     if (table->count * 10 >= table->capacity * 7) {
@@ -123,9 +123,9 @@ string_table_free(struct StringTable* st)
 }
 
 int
-string_table_append(struct StringTable* st, const char* str, uint16_t len)
+string_table_append(struct StringTable* st, const char* str, uint32_t len)
 {
-    size_t need = st->len + 2 + len;  /* 2 bytes for length prefix */
+    size_t need = st->len + 4 + len;  /* 4 bytes for uint32 length prefix */
     if (need > st->cap) {
         size_t new_cap = st->cap;
         while (new_cap < need) new_cap *= 2;
@@ -135,9 +135,9 @@ string_table_append(struct StringTable* st, const char* str, uint16_t len)
         st->cap = new_cap;
     }
 
-    /* Write [uint16_t len][char data[len]] */
-    memcpy(st->data + st->len, &len, 2);
-    memcpy(st->data + st->len + 2, str, len);
-    st->len += 2 + len;
+    /* Write [uint32_t len][char data[len]] */
+    memcpy(st->data + st->len, &len, 4);
+    memcpy(st->data + st->len + 4, str, len);
+    st->len += 4 + len;
     return 0;
 }

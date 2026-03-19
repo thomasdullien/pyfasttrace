@@ -5,6 +5,8 @@
  *
  * Reads binary chunks, reconstructs string tables, emits Chrome Trace JSON.
  * Designed for multi-gigabyte inputs: mmap's the input, streams the output.
+ *
+ * Supports format v2 (12-byte events, uint32 func_id).
  */
 
 #define _GNU_SOURCE
@@ -18,32 +20,35 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-/* ── Must match fasttracer.h ───────────────────────────────────────── */
+/* ── Must match fasttracer.h v2 ────────────────────────────────────── */
 
 #define FT_MAGIC       0x43525446
-#define FT_VERSION     1
+#define FT_VERSION     2
 #define FT_MAX_THREADS 256
-#define FT_EVENT_EXIT_BIT  0x8000
-#define FT_FUNC_ID_MASK    0x7FFF
+
+/* Exit flag in the flags byte (v2) */
+#define FT_FLAG_EXIT       (1 << 7)
 #define FT_FLAG_C_FUNCTION (1 << 0)
+#define FT_FLAG_SYNTHETIC  (1 << 1)
 
 struct __attribute__((packed)) BinaryEvent {
     uint32_t ts_delta_us;
-    uint16_t func_id;
+    uint32_t func_id;       /* full 32-bit string table index */
     uint8_t  tid_idx;
-    uint8_t  flags;
+    uint8_t  flags;         /* bit 0: C function, bit 1: synthetic, bit 7: EXIT */
+    uint16_t _pad;
 };
 
 struct __attribute__((packed)) BufferHeader {
     uint32_t magic;
     uint32_t version;
     uint32_t pid;
-    uint32_t _pad0;
+    uint32_t num_strings;   /* uint32 in v2 (was uint16 + pad in v1) */
     int64_t  base_ts_ns;
     uint32_t num_events;
-    uint16_t num_strings;
     uint8_t  num_threads;
     uint8_t  _pad1;
+    uint16_t _pad2;
     uint64_t thread_table[FT_MAX_THREADS];
     uint32_t string_table_offset;
     uint32_t events_offset;
@@ -53,16 +58,17 @@ struct __attribute__((packed)) BufferHeader {
 
 struct StringEntry {
     const char* data;
-    uint16_t    len;
+    uint32_t    len;
 };
 
 /*
  * Parse the string table from a chunk.
+ * v2 uses uint32 length prefix per string.
  * Returns heap-allocated array of (num_strings+1) entries (index 0 = "<unknown>").
  * Caller must free the returned array.
  */
 static struct StringEntry*
-parse_string_table(const char* base, uint32_t st_offset, uint16_t num_strings,
+parse_string_table(const char* base, uint32_t st_offset, uint32_t num_strings,
                    size_t chunk_size)
 {
     struct StringEntry* strings = calloc(num_strings + 1, sizeof(struct StringEntry));
@@ -74,11 +80,11 @@ parse_string_table(const char* base, uint32_t st_offset, uint16_t num_strings,
     const char* p = base + st_offset;
     const char* end = base + chunk_size;
 
-    for (uint16_t i = 0; i < num_strings; i++) {
-        if (p + 2 > end) break;
-        uint16_t slen;
-        memcpy(&slen, p, 2);
-        p += 2;
+    for (uint32_t i = 0; i < num_strings; i++) {
+        if (p + 4 > end) break;
+        uint32_t slen;
+        memcpy(&slen, p, 4);
+        p += 4;
         if (p + slen > end) break;
         strings[i + 1].data = p;
         strings[i + 1].len = slen;
@@ -94,7 +100,7 @@ parse_string_table(const char* base, uint32_t st_offset, uint16_t num_strings,
 
 struct StackEntry {
     double   ts;
-    uint16_t func_id;
+    uint32_t func_id;
     uint8_t  flags;
 };
 
@@ -108,10 +114,10 @@ static struct ThreadStack thread_stacks[FT_MAX_THREADS];
 /* ── Escape a string for JSON output ───────────────────────────────── */
 
 static void
-fwrite_json_string(FILE* out, const char* s, uint16_t len)
+fwrite_json_string(FILE* out, const char* s, uint32_t len)
 {
     fputc('"', out);
-    for (uint16_t i = 0; i < len; i++) {
+    for (uint32_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)s[i];
         switch (c) {
         case '"':  fputs("\\\"", out); break;
@@ -176,12 +182,12 @@ process_file(const char* path, FILE* out, int* first_event)
             break;
         }
         if (hdr->version != FT_VERSION) {
-            fprintf(stderr, "Unknown version %u at offset %zu in %s\n",
-                    hdr->version, offset, path);
+            fprintf(stderr, "Unknown version %u at offset %zu in %s (expected %d)\n",
+                    hdr->version, offset, path, FT_VERSION);
             break;
         }
 
-        /* Compute chunk size: events_offset + num_events * 8 */
+        /* Compute chunk size: events_offset + num_events * sizeof(BinaryEvent) */
         size_t chunk_end = offset + hdr->events_offset +
                            (size_t)hdr->num_events * sizeof(struct BinaryEvent);
         if (chunk_end > file_size) {
@@ -198,7 +204,7 @@ process_file(const char* path, FILE* out, int* first_event)
             break;
         }
 
-        uint16_t num_strings = hdr->num_strings;
+        uint32_t num_strings = hdr->num_strings;
 
         /* Emit process_name metadata (viztracer compat) */
         if (!*first_event) {
@@ -227,15 +233,15 @@ process_file(const char* path, FILE* out, int* first_event)
         /* Reset per-thread stacks for this chunk */
         memset(thread_stacks, 0, sizeof(thread_stacks));
 
-        /* Walk events, converting B/E pairs to viztracer-compatible "X" events */
+        /* Walk events */
         const struct BinaryEvent* events =
             (const struct BinaryEvent*)(data + offset + hdr->events_offset);
 
         for (uint32_t i = 0; i < hdr->num_events; i++) {
             const struct BinaryEvent* ev = &events[i];
 
-            int is_exit = (ev->func_id & FT_EVENT_EXIT_BIT) != 0;
-            uint16_t fid = ev->func_id & FT_FUNC_ID_MASK;
+            int is_exit = (ev->flags & FT_FLAG_EXIT) != 0;
+            uint32_t fid = ev->func_id;
 
             /* Absolute timestamp in microseconds (CLOCK_MONOTONIC) */
             double abs_ts_us = (double)hdr->base_ts_ns / 1000.0 +
@@ -269,7 +275,7 @@ process_file(const char* path, FILE* out, int* first_event)
 
                 /* Resolve function name from the entry's func_id */
                 const char* name;
-                uint16_t name_len;
+                uint32_t name_len;
                 if (entry->func_id > 0 && entry->func_id <= num_strings) {
                     name = strings[entry->func_id].data;
                     name_len = strings[entry->func_id].len;
