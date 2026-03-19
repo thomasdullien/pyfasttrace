@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <time.h>
@@ -124,8 +125,15 @@ typedef struct {
     struct ThreadMap thread_map;
     pthread_key_t   tls_key;            /* ThreadStack per thread            */
 
-    /* Flush */
-    pid_t           flush_child;        /* PID of child doing flush, or 0    */
+    /* Writer thread (replaces fork-based flush to avoid CUDA conflicts) */
+    pthread_t       writer_thread;
+    sem_t           flush_sem;          /* posted when a buffer is ready     */
+    sem_t           flush_done;         /* posted when the write completes   */
+    int             flush_buf;          /* buffer index to write (0 or 1)    */
+    size_t          flush_bytes;        /* bytes to write                    */
+    char            flush_path[512];    /* output path for pending write     */
+    int             writer_stop;        /* 1 = tell writer thread to exit    */
+    int             writer_started;     /* 1 = thread was created            */
     char*           output_dir;         /* directory for .ftrc files         */
 
     /* Rollover */

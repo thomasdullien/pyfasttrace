@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
-#include <sys/wait.h>
+/* No sys/wait.h — we use a writer thread instead of fork+waitpid */
 #include <sys/syscall.h>
 #include <errno.h>
 
@@ -19,12 +19,38 @@ static inline pid_t ft_gettid(void) {
 /* ── Forward declarations ──────────────────────────────────────────── */
 
 static int  ft_flush_buffer(FastTracerObject* self, int sync);
-static void ft_reset_child_after_fork(FastTracerObject* self);
 static uint32_t ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func);
 static struct ThreadStack* ft_get_thread_stack(FastTracerObject* self);
 static uint8_t ft_get_tid_idx(FastTracerObject* self);
 static void ft_rollover(FastTracerObject* self);
 static PyObject* ft_thread_profile_func(PyObject* obj, PyObject* args);
+
+/* ── Writer thread ─────────────────────────────────────────────────── */
+
+static void*
+ft_writer_thread(void* arg)
+{
+    FastTracerObject* self = (FastTracerObject*)arg;
+    while (1) {
+        sem_wait(&self->flush_sem);
+        if (self->writer_stop) break;
+
+        int fd = open(self->flush_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            size_t written = 0;
+            while (written < self->flush_bytes) {
+                ssize_t n = write(fd,
+                    (char*)self->buffers[self->flush_buf] + written,
+                    self->flush_bytes - written);
+                if (n <= 0) break;
+                written += n;
+            }
+            close(fd);
+        }
+        sem_post(&self->flush_done);
+    }
+    return NULL;
+}
 
 /* ── File path helper ──────────────────────────────────────────────── */
 
@@ -45,10 +71,11 @@ ft_make_output_path(FastTracerObject* self, char* buf, size_t buflen)
 static inline void
 ft_record_event(FastTracerObject* self, uint32_t func_id, uint8_t flags)
 {
-    /* Fork detection */
-    pid_t current_pid = getpid();
-    if (current_pid != self->pid) {
-        ft_reset_child_after_fork(self);
+    /* Fork detection — if the application forks, stop tracing in the child.
+     * We no longer fork ourselves, but the app might. */
+    if (getpid() != self->pid) {
+        self->collecting = 0;
+        return;
     }
 
     int64_t now_ns = ft_get_monotonic_ns();
@@ -473,20 +500,8 @@ ft_get_tid_idx(FastTracerObject* self)
     return idx;
 }
 
-/* ── Fork detection ────────────────────────────────────────────────── */
-
-static void
-ft_reset_child_after_fork(FastTracerObject* self)
-{
-    self->pid = getpid();
-    self->base_ts_ns = ft_get_monotonic_ns();
-    self->write_offset = self->events_start;
-    self->flush_child = 0;
-
-    /* Reset thread map — only current thread survives */
-    self->thread_map.count = 0;
-    ft_get_tid_idx(self);  /* re-register current thread as idx 0 */
-}
+/* (Fork detection is now handled inline in ft_record_event —
+   if the app forks, we simply stop tracing in the child.) */
 
 /* ── Synthetic event recording (for rollover) ──────────────────────── */
 
@@ -592,12 +607,6 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     self->base_ts_ns = ft_get_monotonic_ns();
     atomic_store_explicit(&self->write_offset, self->events_start, memory_order_relaxed);
 
-    /* Wait for previous flush child if still running (back-pressure) */
-    if (self->flush_child > 0) {
-        waitpid(self->flush_child, NULL, 0);
-        self->flush_child = 0;
-    }
-
     /* Total bytes to write: up to the end of events */
     size_t total_bytes = bytes_written;
 
@@ -606,46 +615,31 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     ft_make_output_path(self, path, sizeof(path));
 
     if (sync) {
-        /* Synchronous flush (called from stop() or rollover) */
+        /* Synchronous flush (called from stop() or rollover).
+         * Wait for any in-flight async write first. */
+        sem_wait(&self->flush_done);
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
             write(fd, self->buffers[buf_to_flush], total_bytes);
             close(fd);
         }
+        /* Re-post flush_done so future waits don't block */
+        sem_post(&self->flush_done);
         self->cumulative_bytes += total_bytes;
         return 0;
     }
 
-    /* Async flush via fork */
-    pid_t child = fork();
-    if (child == 0) {
-        /* Child process: write and exit.
-         * Close NVIDIA GPU file descriptors inherited from the parent
-         * to prevent the driver from counting our (soon-dead) process
-         * against the parent's GPU memory budget. */
-        for (int nfd = 3; nfd < 1024; nfd++) {
-            /* Close all fds except stdin/stdout/stderr.
-             * This is aggressive but safe — the child only needs to
-             * write to a new fd it opens below. */
-            close(nfd);
-        }
-        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd >= 0) {
-            /* Single sequential write */
-            size_t written = 0;
-            while (written < total_bytes) {
-                ssize_t n = write(fd, (char*)self->buffers[buf_to_flush] + written,
-                                  total_bytes - written);
-                if (n <= 0) break;
-                written += n;
-            }
-            close(fd);
-        }
-        _exit(0);
-    } else if (child > 0) {
-        self->flush_child = child;
-    }
-    /* If fork fails, we lose the buffer. Acceptable for a tracer. */
+    /* Async flush via writer thread (no fork — safe with CUDA) */
+    /* Wait for previous async write to complete (back-pressure) */
+    sem_wait(&self->flush_done);
+
+    /* Set up the flush request */
+    self->flush_buf = buf_to_flush;
+    self->flush_bytes = total_bytes;
+    ft_make_output_path(self, self->flush_path, sizeof(self->flush_path));
+
+    /* Signal the writer thread */
+    sem_post(&self->flush_sem);
 
     self->cumulative_bytes += total_bytes;
 
@@ -666,11 +660,9 @@ ft_rollover(FastTracerObject* self)
     int was_collecting = self->collecting;
     self->collecting = 0;
 
-    /* Wait for any in-flight flush child */
-    if (self->flush_child > 0) {
-        waitpid(self->flush_child, NULL, 0);
-        self->flush_child = 0;
-    }
+    /* Wait for any in-flight async write to complete */
+    sem_wait(&self->flush_done);
+    sem_post(&self->flush_done);  /* re-post so sync flush doesn't block */
 
     /* Emit synthetic exits for all open frames into active buffer */
     ft_emit_synthetic_exits(self);
@@ -709,7 +701,8 @@ FastTracer_new(PyTypeObject* type, PyObject* Py_UNUSED(args), PyObject* Py_UNUSE
     self->events_start = 0;
     self->base_ts_ns = 0;
     self->pid = 0;
-    self->flush_child = 0;
+    self->writer_stop = 0;
+    self->writer_started = 0;
     self->output_dir = NULL;
     self->collecting = 0;
     self->max_stack_depth = FT_MAX_STACK_DEPTH;
@@ -764,7 +757,17 @@ FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
     self->write_offset = self->events_start;
     self->base_ts_ns = ft_get_monotonic_ns();
     self->pid = getpid();
-    self->flush_child = 0;
+
+    /* Writer thread setup — init flush_done to 1 so the first
+     * sem_wait(&flush_done) in ft_flush_buffer returns immediately */
+    sem_init(&self->flush_sem, 0, 0);
+    sem_init(&self->flush_done, 0, 1);
+    self->writer_stop = 0;
+    if (pthread_create(&self->writer_thread, NULL, ft_writer_thread, self) != 0) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return -1;
+    }
+    self->writer_started = 1;
 
     /* Output directory */
     self->output_dir = strdup(output_dir);
@@ -799,9 +802,16 @@ FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
 static void
 FastTracer_dealloc(FastTracerObject* self)
 {
-    /* Wait for any in-flight flush */
-    if (self->flush_child > 0) {
-        waitpid(self->flush_child, NULL, 0);
+    /* Shut down writer thread */
+    if (self->writer_started) {
+        /* Wait for any in-flight write to finish */
+        sem_wait(&self->flush_done);
+        /* Tell writer thread to exit */
+        self->writer_stop = 1;
+        sem_post(&self->flush_sem);
+        pthread_join(self->writer_thread, NULL);
+        sem_destroy(&self->flush_sem);
+        sem_destroy(&self->flush_done);
     }
 
     for (int i = 0; i < 2; i++) {

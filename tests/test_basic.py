@@ -24,7 +24,7 @@ def test_import():
 def test_start_stop(trace_dir):
     from fasttracer import FastTracer
 
-    t = FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir)
+    t = FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir)
     t.start()
 
     # Do some work that generates trace events
@@ -54,7 +54,7 @@ def test_context_manager(trace_dir):
     def bar():
         return sum(range(100))
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         for _ in range(50):
             bar()
 
@@ -72,7 +72,7 @@ def test_converter(trace_dir):
             return 1
         return baz(n - 1) + baz(n - 2)
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         baz(10)
 
     events = convert_file(t.output_path)
@@ -107,7 +107,7 @@ def test_nested_functions(trace_dir):
     def inner():
         return 42
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         outer()
 
     events = convert_file(t.output_path)
@@ -134,7 +134,7 @@ def test_exception_handling(trace_dir):
         except ValueError:
             pass
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         for _ in range(10):
             catcher()
 
@@ -159,7 +159,7 @@ def test_c_converter_basic(trace_dir):
             return 1
         return fib(n - 1) + fib(n - 2)
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         fib(10)
 
     json_path = os.path.join(trace_dir, "out.json")
@@ -196,7 +196,7 @@ def test_c_converter_matches_python(trace_dir):
     def work():
         return sum(range(100))
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         for _ in range(20):
             work()
 
@@ -245,7 +245,7 @@ def test_c_converter_nested(trace_dir):
     def inner():
         return 42
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         outer()
 
     json_path = os.path.join(trace_dir, "out.json")
@@ -275,7 +275,7 @@ def test_c_converter_exceptions(trace_dir):
         except ValueError:
             pass
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         for _ in range(10):
             catcher()
 
@@ -303,7 +303,7 @@ def test_perfetto_loads_trace(trace_dir):
             return 1
         return fib(n - 1) + fib(n - 2)
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         fib(12)
 
     json_path = os.path.join(trace_dir, "out.json")
@@ -351,7 +351,7 @@ def test_perfetto_balanced_events(trace_dir):
     def inner():
         return 42
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         for _ in range(50):
             outer()
 
@@ -391,7 +391,7 @@ def test_perfetto_thread_info(trace_dir):
     def work():
         return sum(range(100))
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         work()
 
     json_path = os.path.join(trace_dir, "out.json")
@@ -428,9 +428,9 @@ def test_rollover_creates_multiple_files(trace_dir):
     # busy() generates ~5 events per call (entry+exit for busy, sum, range, etc.)
     # So ~26K calls should fill one buffer, triggering a flush.
     # With rollover at 2MB and buffer flushes of ~2MB each, we need ~2 flushes.
-    with FastTracer(buffer_size=2 * 1024 * 1024, output_dir=trace_dir,
-                    rollover_size=2 * 1024 * 1024) as t:
-        for _ in range(200000):
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir,
+                    rollover_size=20 * 1024 * 1024) as t:
+        for _ in range(2000000):
             busy()
 
     files = sorted(glob.glob(os.path.join(trace_dir, "*.ftrc")))
@@ -452,9 +452,9 @@ def test_rollover_second_file_self_contained(trace_dir):
             return 0
         return recursive(n - 1) + 1
 
-    with FastTracer(buffer_size=2 * 1024 * 1024, output_dir=trace_dir,
-                    rollover_size=2 * 1024 * 1024) as t:
-        for _ in range(50000):
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir,
+                    rollover_size=20 * 1024 * 1024) as t:
+        for _ in range(500000):
             recursive(5)
 
     files = sorted(glob.glob(os.path.join(trace_dir, "*.ftrc")))
@@ -493,9 +493,9 @@ def test_rollover_synthetic_events(trace_dir):
     def deep():
         return sum(range(100))
 
-    with FastTracer(buffer_size=2 * 1024 * 1024, output_dir=trace_dir,
-                    rollover_size=2 * 1024 * 1024) as t:
-        for _ in range(200000):
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir,
+                    rollover_size=20 * 1024 * 1024) as t:
+        for _ in range(2000000):
             deep()
 
     files = sorted(glob.glob(os.path.join(trace_dir, "*.ftrc")))
@@ -525,7 +525,7 @@ def test_perf_viz_merge_reads_output(trace_dir):
             return 1
         return fib(n - 1) + fib(n - 2)
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=trace_dir) as t:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
         fib(15)
 
     json_path = os.path.join(trace_dir, "trace.json")
@@ -561,9 +561,9 @@ def test_perf_viz_merge_rollover_file(trace_dir):
     def work():
         return sum(range(1000))
 
-    with FastTracer(buffer_size=2 * 1024 * 1024, output_dir=trace_dir,
-                    rollover_size=2 * 1024 * 1024) as t:
-        for _ in range(200000):
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir,
+                    rollover_size=20 * 1024 * 1024) as t:
+        for _ in range(2000000):
             work()
 
     files = sorted(glob.glob(os.path.join(trace_dir, "*.ftrc")))
@@ -602,12 +602,12 @@ def test_c_converter_multiple_files(trace_dir):
     dir1 = os.path.join(trace_dir, "d1")
     dir2 = os.path.join(trace_dir, "d2")
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=dir1) as t1:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=dir1) as t1:
         for _ in range(10):
             alpha()
     path1 = t1.output_path
 
-    with FastTracer(buffer_size=4 * 1024 * 1024, output_dir=dir2) as t2:
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=dir2) as t2:
         for _ in range(10):
             beta()
     path2 = t2.output_path
