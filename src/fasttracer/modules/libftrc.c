@@ -243,34 +243,39 @@ ftrc_next(ftrc_reader* r, ftrc_event* out)
 
     for (;;) {
         /* Phase 1: emit metadata events for current chunk */
-        if (r->meta_phase == 0) {
-            /* Process name */
-            out->type = FTRC_EVENT_METADATA;
-            out->ts_us = 0;
-            out->dur_us = 0;
-            out->pid = r->hdr->pid;
-            out->tid = (r->hdr->num_threads > 0) ? r->hdr->thread_table[0] : 0;
-            out->name = "process_name";
-            out->name_len = 12;
-            out->cat = "metadata";
-            r->meta_phase = 1;
-            return 0;
-        }
-        if (r->meta_phase >= 1 &&
-            r->meta_phase <= (int)r->hdr->num_threads) {
-            int idx = r->meta_phase - 1;
-            out->type = FTRC_EVENT_METADATA;
-            out->ts_us = 0;
-            out->dur_us = 0;
-            out->pid = r->hdr->pid;
-            out->tid = r->hdr->thread_table[idx];
-            snprintf(r->meta_name_buf, sizeof(r->meta_name_buf),
-                     "%s", idx == 0 ? "MainThread" : "Thread");
-            out->name = r->meta_name_buf;
-            out->name_len = (uint32_t)strlen(r->meta_name_buf);
-            out->cat = "metadata";
-            r->meta_phase++;
-            return 0;
+        {
+            /* Use the chunk's base timestamp for metadata events so they
+             * don't skew clock alignment (ts=0 breaks the heuristic). */
+            double chunk_ts_us = (double)r->hdr->base_ts_ns / 1000.0;
+
+            if (r->meta_phase == 0) {
+                out->type = FTRC_EVENT_METADATA;
+                out->ts_us = chunk_ts_us;
+                out->dur_us = 0;
+                out->pid = r->hdr->pid;
+                out->tid = (r->hdr->num_threads > 0) ? r->hdr->thread_table[0] : 0;
+                out->name = "process_name";
+                out->name_len = 12;
+                out->cat = "metadata";
+                r->meta_phase = 1;
+                return 0;
+            }
+            if (r->meta_phase >= 1 &&
+                r->meta_phase <= (int)r->hdr->num_threads) {
+                int idx = r->meta_phase - 1;
+                out->type = FTRC_EVENT_METADATA;
+                out->ts_us = chunk_ts_us;
+                out->dur_us = 0;
+                out->pid = r->hdr->pid;
+                out->tid = r->hdr->thread_table[idx];
+                snprintf(r->meta_name_buf, sizeof(r->meta_name_buf),
+                         "%s", idx == 0 ? "MainThread" : "Thread");
+                out->name = r->meta_name_buf;
+                out->name_len = (uint32_t)strlen(r->meta_name_buf);
+                out->cat = "metadata";
+                r->meta_phase++;
+                return 0;
+            }
         }
 
         /* Phase 2: process raw events, emit completed X events */
