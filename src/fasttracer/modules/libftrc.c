@@ -169,8 +169,10 @@ advance_to_next_chunk(ftrc_reader* r)
             (r->data + r->chunk_offset + hdr->events_offset);
         r->chunk_end = chunk_end;
 
-        /* Reset stacks for this chunk */
-        memset(r->stacks, 0, sizeof(r->stacks));
+        /* Do NOT reset stacks between chunks within the same file.
+         * Chunks are buffer flushes, not separate traces — open call
+         * frames from one chunk continue into the next. Only rollover
+         * file boundaries should reset stacks. */
 
         /* Start metadata emission: process_name first, then thread names */
         r->meta_phase = 0;
