@@ -454,12 +454,11 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
         return 0;
     }
 
-    /* Keep the Python object alive so its pointer stays valid as an
-     * intern table key.  Without this, the object can be GC'd and its
-     * address reused by a different object, causing name corruption.
-     * The memory cost is negligible — these objects are already alive
-     * in the Python runtime. */
-    Py_INCREF(func_obj);
+    /* No Py_INCREF — keeping references alive causes CUDA OOM because
+     * traced objects (e.g. torch tensors passed as arguments) are never
+     * freed.  Instead, rely on the identity tag to detect pointer reuse:
+     * if a GC'd object's address is reused, the tag mismatch triggers
+     * re-interning with the correct name. */
     if (intern_insert(&self->intern, (void*)func_obj, tag, fid) < 0) {
         return 0;
     }
