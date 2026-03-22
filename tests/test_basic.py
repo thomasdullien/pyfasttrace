@@ -586,6 +586,327 @@ def test_perf_viz_merge_rollover_file(trace_dir):
     assert os.path.getsize(output_path) > 0, "Output file is empty"
 
 
+# ── Function name correctness tests ───────────────────────────────────
+# These tests verify that the intern table produces correct function names,
+# particularly in scenarios where CPython reuses memory addresses for
+# temporary bound method objects (e.g., list.append, dict.update).
+
+
+def test_function_names_match_calls(trace_dir):
+    """Traced function names must match the functions that were actually called."""
+    from fasttracer import FastTracer
+    from fasttracer.convert import convert_file
+
+    def alpha():
+        return 1
+
+    def beta():
+        return alpha()
+
+    def gamma():
+        return beta()
+
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
+        for _ in range(50):
+            gamma()
+
+    events = convert_file(t.output_path)
+    relevant = [e for e in events if any(
+        name in e["name"] for name in ("alpha", "beta", "gamma")
+    )]
+
+    alpha_events = [e for e in relevant if "alpha" in e["name"]]
+    beta_events = [e for e in relevant if "beta" in e["name"]]
+    gamma_events = [e for e in relevant if "gamma" in e["name"]]
+
+    assert len(alpha_events) == 50, f"Expected 50 alpha calls, got {len(alpha_events)}"
+    assert len(beta_events) == 50, f"Expected 50 beta calls, got {len(beta_events)}"
+    assert len(gamma_events) == 50, f"Expected 50 gamma calls, got {len(gamma_events)}"
+
+
+def test_c_builtins_do_not_corrupt_names(trace_dir):
+    """C built-in methods (list.append, dict.update, etc.) create temporary
+    bound method objects that CPython may free and reallocate at the same
+    address. This must not corrupt the intern table's function name mapping.
+    """
+    from fasttracer import FastTracer
+    from fasttracer.convert import convert_file
+
+    def do_work():
+        """Call many different C built-in methods to trigger address reuse."""
+        lst = []
+        for i in range(20):
+            lst.append(i)          # list.append
+        d = {}
+        for i in range(20):
+            d.update({i: i})       # dict.update
+        s = set()
+        for i in range(20):
+            s.add(i)               # set.add
+        lst.sort()                 # list.sort
+        lst.reverse()              # list.reverse
+        lst.clear()                # list.clear
+        return len(d)
+
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
+        for _ in range(100):
+            do_work()
+
+    events = convert_file(t.output_path)
+    do_work_events = [e for e in events if "do_work" in e["name"]]
+
+    assert len(do_work_events) == 100, (
+        f"Expected 100 do_work events, got {len(do_work_events)}"
+    )
+
+    # Verify that C built-in names are recognizable (not swapped with
+    # unrelated functions). Each name should contain the method it represents.
+    c_events = [e for e in events if any(
+        m in e["name"] for m in ("append", "update", "add", "sort", "reverse", "clear")
+    )]
+    assert len(c_events) > 0, "No C built-in method events found"
+
+    # None of the C built-in events should have a Python function's name
+    for e in c_events:
+        assert "do_work" not in e["name"], (
+            f"C built-in event has wrong name: {e['name']}"
+        )
+
+
+def test_interleaved_c_and_python_calls(trace_dir):
+    """Rapidly alternating between Python and C function calls must not
+    cause name corruption through intern table pointer reuse.
+    """
+    from fasttracer import FastTracer
+    from fasttracer.convert import convert_file
+
+    def py_func():
+        return 42
+
+    def mixed_work():
+        result = []
+        for _ in range(10):
+            result.append(py_func())  # C call (append) then Python call (py_func)
+        return result
+
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
+        for _ in range(200):
+            mixed_work()
+
+    events = convert_file(t.output_path)
+
+    mixed_events = [e for e in events if "mixed_work" in e["name"]]
+    py_func_events = [e for e in events if "py_func" in e["name"]]
+    append_events = [e for e in events if "append" in e["name"]]
+
+    assert len(mixed_events) == 200, (
+        f"Expected 200 mixed_work, got {len(mixed_events)}"
+    )
+    assert len(py_func_events) == 2000, (
+        f"Expected 2000 py_func, got {len(py_func_events)}"
+    )
+    assert len(append_events) == 2000, (
+        f"Expected 2000 append, got {len(append_events)}"
+    )
+
+    # Verify no name swaps: append events must not contain "py_func"
+    for e in append_events:
+        assert "py_func" not in e["name"], (
+            f"append event has py_func name: {e['name']}"
+        )
+    for e in py_func_events:
+        assert "append" not in e["name"], (
+            f"py_func event has append name: {e['name']}"
+        )
+
+
+def test_threaded_function_names(trace_dir):
+    """Worker thread call stacks must have correct function names,
+    not names swapped from the main thread or other workers.
+    """
+    import threading
+    from fasttracer import FastTracer
+    from fasttracer.convert import convert_file
+
+    def recursive_work(n):
+        if n <= 0:
+            return 0
+        lst = []
+        lst.append(n)  # C built-in — triggers temporary object allocation
+        return recursive_work(n - 1) + lst[0]
+
+    errors = []
+
+    def worker(iterations):
+        try:
+            for _ in range(iterations):
+                recursive_work(5)
+        except Exception as exc:
+            errors.append(exc)
+
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
+        threads = [threading.Thread(target=worker, args=(100,)) for _ in range(4)]
+        for th in threads:
+            th.start()
+        # Also do work on the main thread
+        worker(100)
+        for th in threads:
+            th.join()
+
+    assert not errors, f"Worker threads raised exceptions: {errors}"
+
+    events = convert_file(t.output_path)
+
+    rw_events = [e for e in events if "recursive_work" in e["name"]]
+    append_events = [e for e in events if "append" in e["name"]]
+
+    # Due to GIL contention and PyEval_SetProfile per-thread registration,
+    # not all worker threads may be fully traced. Require at least the main
+    # thread's contribution (100 iterations × 6 calls = 600).
+    assert len(rw_events) >= 600, (
+        f"Expected at least 600 recursive_work events, got {len(rw_events)}"
+    )
+
+    # Critical: no recursive_work event should be named "append" and vice versa
+    for e in rw_events:
+        assert "append" not in e["name"], (
+            f"recursive_work event corrupted with append name: {e['name']}"
+        )
+    for e in append_events:
+        assert "recursive_work" not in e["name"], (
+            f"append event corrupted with recursive_work name: {e['name']}"
+        )
+
+
+def test_many_unique_c_functions(trace_dir):
+    """Interning many distinct C functions must not cause hash collisions
+    that corrupt function names.
+    """
+    from fasttracer import FastTracer
+    from fasttracer.convert import convert_file
+
+    def exercise_many_builtins():
+        # Exercise a wide variety of C built-in methods
+        lst = [3, 1, 2]
+        lst.append(4)
+        lst.extend([5, 6])
+        lst.insert(0, 0)
+        lst.pop()
+        lst.remove(0)
+        lst.sort()
+        lst.reverse()
+        lst.copy()
+        lst.count(1)
+        lst.index(1)
+        lst.clear()
+
+        d = {"a": 1}
+        d.update({"b": 2})
+        d.get("a")
+        d.keys()
+        d.values()
+        d.items()
+        d.pop("b")
+        d.setdefault("c", 3)
+        d.copy()
+        d.clear()
+
+        s = {1, 2, 3}
+        s.add(4)
+        s.remove(4)
+        s.discard(99)
+        s.union({5})
+        s.intersection({1, 2})
+        s.difference({3})
+        s.copy()
+        s.clear()
+
+        "hello world".split()
+        "hello".upper()
+        "HELLO".lower()
+        " hi ".strip()
+        "hello".replace("l", "r")
+        ",".join(["a", "b"])
+
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
+        for _ in range(50):
+            exercise_many_builtins()
+
+    events = convert_file(t.output_path)
+    wrapper_events = [e for e in events if "exercise_many_builtins" in e["name"]]
+
+    assert len(wrapper_events) == 50, (
+        f"Expected 50 exercise_many_builtins, got {len(wrapper_events)}"
+    )
+
+    # Collect all unique function names observed
+    all_names = {e["name"] for e in events}
+
+    # Not all C built-in methods generate C_CALL trace events in all Python
+    # versions (e.g., single-arg builtins may be optimized away in 3.10).
+    # Verify we see at least a few distinct C built-in names alongside our
+    # Python wrapper — the key property is that names are not corrupted.
+    c_builtin_keywords = [
+        "append", "extend", "insert", "sort", "reverse", "update",
+        "split", "upper", "lower", "strip", "replace", "join",
+        "add", "union", "intersection",
+    ]
+    found = [kw for kw in c_builtin_keywords if any(kw in n for n in all_names)]
+    assert len(found) >= 2, (
+        f"Expected at least 2 distinct C built-in names, found {len(found)}: {found}"
+    )
+
+    # The critical check: no C built-in event should be named
+    # "exercise_many_builtins" (name corruption from pointer reuse)
+    for name in all_names:
+        if any(kw in name for kw in c_builtin_keywords):
+            assert "exercise_many_builtins" not in name, (
+                f"C built-in event has corrupted name: {name}"
+            )
+
+
+def test_c_converter_name_correctness(trace_dir):
+    """Verify the C converter (ftrc2json) also produces correct function names
+    under pointer-reuse conditions.
+    """
+    from fasttracer import FastTracer, ftrc2json
+    from fasttracer.convert import convert_file
+
+    def target_func():
+        lst = []
+        for i in range(10):
+            lst.append(i)
+        return lst
+
+    with FastTracer(buffer_size=32 * 1024 * 1024, output_dir=trace_dir) as t:
+        for _ in range(100):
+            target_func()
+
+    # Python converter
+    py_events = convert_file(t.output_path)
+
+    # C converter
+    json_path = os.path.join(trace_dir, "out.json")
+    ftrc2json(t.output_path, json_path)
+    with open(json_path) as f:
+        c_trace = json.load(f)
+    c_events = [e for e in c_trace["traceEvents"] if e["ph"] == "X"]
+
+    # Both converters should agree on function names
+    py_target = [e for e in py_events if "target_func" in e["name"]]
+    c_target = [e for e in c_events if "target_func" in e["name"]]
+
+    assert len(py_target) == 100, f"Python converter: expected 100 target_func, got {len(py_target)}"
+    assert len(c_target) == 100, f"C converter: expected 100 target_func, got {len(c_target)}"
+
+    py_append = [e for e in py_events if "append" in e["name"]]
+    c_append = [e for e in c_events if "append" in e["name"]]
+
+    assert len(py_append) == len(c_append), (
+        f"Append count mismatch: Python={len(py_append)}, C={len(c_append)}"
+    )
+
+
 # ── C converter multi-file test ────────────────────────────────────────
 
 
