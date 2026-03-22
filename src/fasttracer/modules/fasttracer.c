@@ -120,6 +120,7 @@ ft_profile_callback(PyObject* obj, PyFrameObject* frame, int what, PyObject* arg
     FastTracerObject* self = (FastTracerObject*)obj;
     if (!self->collecting) return 0;
 
+
     struct ThreadStack* stack = ft_get_thread_stack(self);
     if (!stack) return 0;
 
@@ -454,11 +455,11 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
         return 0;
     }
 
-    /* No Py_INCREF — keeping references alive causes CUDA OOM because
-     * traced objects (e.g. torch tensors passed as arguments) are never
-     * freed.  Instead, rely on the identity tag to detect pointer reuse:
-     * if a GC'd object's address is reused, the tag mismatch triggers
-     * re-interning with the correct name. */
+    /* Keep the object alive so its pointer remains a valid intern key.
+     * Without this, CPython reuses addresses for temporary bound method
+     * objects, corrupting the intern table. Objects are PyCodeObject and
+     * PyCFunctionObject — small metadata, not CUDA tensors. */
+    Py_INCREF(func_obj);
     if (intern_insert(&self->intern, (void*)func_obj, tag, fid) < 0) {
         return 0;
     }
