@@ -1,21 +1,24 @@
 # fasttracer
 
-High-performance Python function tracer with 8-byte binary events, double-buffered
-mmap'd memory regions, and fork-based async flushing. Designed for tracing
-production systems for hours with predictable memory usage and minimal overhead.
+High-performance Python function tracer with 12-byte binary events, double-buffered
+mmap'd memory regions, and thread-based async flushing. Designed for tracing
+GPU-accelerated production systems for hours with predictable memory usage and
+minimal overhead.
 
 Timestamps use `CLOCK_MONOTONIC` for direct correlation with Linux `perf` data
 via [perf-viz-merge](https://github.com/thomasdullien/perf-viz-merge).
 
 ## Features
 
-- **8 bytes per event** — fixed-size entry/exit records with microsecond timestamps
+- **12 bytes per event** — fixed-size entry/exit records with microsecond timestamps and up to 16M unique function names
 - **~50ns per event overhead** — `clock_gettime` + atomic write to mmap'd buffer
-- **Fork-based flush** — child process writes to disk via COW; parent never blocks
-- **Double buffering** — one buffer active, one flushing; predictable memory (2 x buffer_size)
+- **Thread-based flush** — dedicated writer thread handles disk I/O; no fork (safe with CUDA)
+- **Double buffering** — one buffer active, one flushing; predictable memory (2 × buffer_size)
 - **File rollover** — automatic rollover at configurable size with synthetic stack events, so each file is self-contained and old files can be deleted
 - **CLOCK_MONOTONIC timestamps** — directly correlatable with `perf record -k CLOCK_MONOTONIC`
+- **Linux kernel TIDs** — uses `gettid()` for thread IDs that match perf data
 - **Python 3.10+** — uses `PyEval_SetProfile` on 3.10/3.11, `sys.monitoring` on 3.12+
+- **libftrc C API** — read `.ftrc` files from C/C++ without JSON conversion
 
 ## Installation
 
@@ -82,6 +85,21 @@ ftrc2json /tmp/traces/12345.ftrc -o trace.json
 ftrc2json-py /tmp/traces/12345.ftrc -o trace.json
 ```
 
+### Reading .ftrc files from C/C++ (libftrc)
+
+For tools that need to read `.ftrc` files directly (e.g., perf-viz-merge):
+
+```c
+#include "libftrc.h"
+
+ftrc_reader* r = ftrc_open("trace.ftrc");
+ftrc_event ev;
+while (ftrc_next(r, &ev) == 0) {
+    printf("%.*s: %.3f us\n", ev.name_len, ev.name, ev.dur_us);
+}
+ftrc_close(r);
+```
+
 ### Viewing in Perfetto
 
 Open https://ui.perfetto.dev and load the JSON file, or convert to native Perfetto
@@ -105,11 +123,10 @@ with FastTracer(output_dir="/tmp/traces"):
     main()
 ```
 
-Convert and merge:
+Merge directly (no JSON conversion needed):
 
 ```bash
-ftrc2json /tmp/traces/*.ftrc -o trace.json
-perf-viz-merge --perf perf.data --viz trace.json -o merged.perfetto-trace
+perf-viz-merge --perf perf.data --viz /tmp/traces/*.ftrc -o merged.perfetto-trace
 ```
 
 ### File rollover for long-running traces
@@ -126,25 +143,28 @@ This produces sequentially numbered files (`12345_0000.ftrc`, `12345_0001.ftrc`,
 Each file is self-contained — synthetic entry/exit events at file boundaries ensure
 stack traces are valid even if earlier files are deleted.
 
-## Binary format
+## Binary format (v2)
 
-Each `.ftrc` file contains one or more self-contained chunks:
+Each `.ftrc` file contains one or more chunks (from buffer flushes):
 
 ```
 [BufferHeader][StringTable][Event0][Event1]...[EventN]
 ```
 
-Events are 8 bytes each:
+Events are 12 bytes each:
 
 | Field | Size | Description |
 |-------|------|-------------|
 | `ts_delta_us` | 4 bytes | Microseconds since chunk's base timestamp |
-| `func_id` | 2 bytes | Bits 0-14: string table index; bit 15: 0=entry, 1=exit |
+| `func_id` | 4 bytes | String table index (1-based, 0 = unknown) |
 | `tid_idx` | 1 byte | Thread index (0-255) |
-| `flags` | 1 byte | Bit 0: C function; bit 1: synthetic (rollover) |
+| `flags` | 1 byte | Bit 0: C function; bit 1: synthetic; bit 7: exit |
+| `_pad` | 2 bytes | Reserved |
 
 The buffer header contains the CLOCK_MONOTONIC base timestamp, PID, thread ID
-table, and string table (function names resolved at trace time).
+table (using Linux kernel TIDs from `gettid()`), and string table with uint32
+length-prefixed entries. String tables grow monotonically across chunks — func_ids
+from earlier chunks remain valid in later chunks.
 
 ## Running tests
 
