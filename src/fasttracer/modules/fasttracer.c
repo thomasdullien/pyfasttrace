@@ -454,10 +454,12 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
         return 0;
     }
 
-    /* No Py_INCREF — we do not hold references to Python objects.
-     * The intern table uses (pointer, tag) for lookup.  If the object is
-     * freed and the address reused, the tag mismatch triggers re-interning
-     * with the correct name. */
+    /* Keep the Python object alive so its pointer stays valid as an
+     * intern table key.  Without this, the object can be GC'd and its
+     * address reused by a different object, causing name corruption.
+     * The memory cost is negligible — these objects are already alive
+     * in the Python runtime. */
+    Py_INCREF(func_obj);
     if (intern_insert(&self->intern, (void*)func_obj, tag, fid) < 0) {
         return 0;
     }
