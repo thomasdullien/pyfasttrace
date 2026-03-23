@@ -499,33 +499,67 @@ ft_disable_monitoring(FastTracerObject* self)
 
 /* ── String interning ──────────────────────────────────────────────── */
 
-/* Compute a lightweight identity tag for a Python object.
- * This is used alongside the pointer to detect address reuse:
- *   - PyCodeObject:    co_firstlineno (unique per function definition)
- *   - PyCFunctionObject: hash of ml_name C string pointer (stable for
- *     the lifetime of the extension module)
- *   - Other:           0 (no tag — rare path, accept potential stale hit)
+/*
+ * Intern key strategy — use stable pointers so we never need Py_INCREF:
+ *
+ *   Python functions (PyCodeObject):
+ *     key  = PyUnicode_DATA(co_filename)  — interned string, process-stable
+ *     tag  = co_firstlineno
+ *     Together these uniquely identify a function definition.
+ *
+ *   C functions (PyCFunctionObject):
+ *     key  = ml_name  — const char* in the extension module's static data
+ *     tag  = 0x80000000  (high bit set to avoid collisions with Python tags)
+ *     ml_name is unique per C method and stable for the process lifetime.
+ *
+ * No Py_INCREF is needed for either case:
+ *   - co_filename's internal data buffer is never freed (interned string)
+ *   - ml_name is a static string compiled into the .so
+ *
+ * Py_INCREF on PyCFunctionObject was previously shown to cause multi-GiB
+ * CUDA memory leaks because m_self holds a reference to GPU tensors.
  */
+
+static inline void*
+ft_intern_key(PyObject* func_obj, int is_c_func)
+{
+    if (!is_c_func && PyCode_Check(func_obj)) {
+        /* Combine co_filename data pointer with co_firstlineno to create
+         * a unique key per function definition.  co_filename is an interned
+         * string (stable), and XORing with line number distinguishes
+         * different functions in the same file. */
+        uintptr_t base = (uintptr_t)PyUnicode_DATA(
+            ((PyCodeObject*)func_obj)->co_filename);
+        uint32_t line = (uint32_t)((PyCodeObject*)func_obj)->co_firstlineno;
+        /* Mix line number into the pointer — multiply by a large odd
+         * constant to spread bits, then XOR into the base. */
+        return (void*)(base ^ ((uintptr_t)line * 2654435761u));
+    } else if (PyCFunction_Check(func_obj)) {
+        /* ml_name is a static const char* in the extension module */
+        return (void*)((PyCFunctionObject*)func_obj)->m_ml->ml_name;
+    }
+    return (void*)func_obj;  /* fallback: use object pointer */
+}
+
 static inline uint32_t
-ft_identity_tag(PyObject* func_obj, int is_c_func)
+ft_intern_tag(PyObject* func_obj, int is_c_func)
 {
     if (!is_c_func && PyCode_Check(func_obj)) {
         return (uint32_t)((PyCodeObject*)func_obj)->co_firstlineno;
-    } else if (PyCFunction_Check(func_obj)) {
-        uintptr_t p = (uintptr_t)((PyCFunctionObject*)func_obj)->m_ml->ml_name;
-        return (uint32_t)(p ^ (p >> 16));
     }
-    return 0;
+    /* C functions: high bit set to distinguish from Python line numbers */
+    return 0x80000000u;
 }
 
 static uint32_t
 ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
 {
-    uint32_t tag = ft_identity_tag(func_obj, is_c_func);
-    uint32_t fid = intern_lookup(&self->intern, (void*)func_obj, tag);
+    void*    key = ft_intern_key(func_obj, is_c_func);
+    uint32_t tag = ft_intern_tag(func_obj, is_c_func);
+    uint32_t fid = intern_lookup(&self->intern, key, tag);
     if (fid != 0) return fid;
 
-    /* Cold path: first time seeing this function (or pointer was reused) */
+    /* Cold path: first time seeing this function */
     if (self->intern.count >= FT_MAX_FUNC_ID) return 0;
 
     fid = (uint32_t)(self->intern.count + 1);
@@ -583,21 +617,7 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
         return 0;
     }
 
-    /* Keep PyCodeObject alive so its pointer remains a valid intern key.
-     * Without this, CPython could reuse the address, corrupting the table.
-     * PyCodeObject are small metadata with module-lifetime scope.
-     *
-     * Do NOT Py_INCREF PyCFunctionObject: these are temporary bound method
-     * objects (e.g., tensor.softmax) whose m_self references the bound
-     * instance.  Preventing their deallocation leaks whatever m_self points
-     * to — including GPU tensors, causing multi-GiB CUDA memory leaks.
-     * Pointer reuse for C functions is handled by the identity tag (ml_name
-     * hash): intern_lookup returns 0 on tag mismatch, triggering re-intern
-     * with a fresh func_id. */
-    if (!is_c_func) {
-        Py_INCREF(func_obj);
-    }
-    if (intern_insert(&self->intern, (void*)func_obj, tag, fid) < 0) {
+    if (intern_insert(&self->intern, key, tag, fid) < 0) {
         return 0;
     }
 
