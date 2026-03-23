@@ -1034,3 +1034,202 @@ raise RuntimeError("simulated crash")
     ftrc_path = os.path.join(trace_dir, ftrc_files[0])
     events = convert_file(ftrc_path)
     assert len(events) > 0, "atexit flush produced an empty trace"
+
+
+# ── Ground truth comparison tests (VizTracer) ──────────────────────────
+
+
+def _short_name(name):
+    """Extract function name without file location."""
+    if " (" in name:
+        return name.split(" (")[0]
+    return name
+
+
+def _run_viztracer_ground_truth(trace_dir):
+    """Run workload under VizTracer, return {short_name: count} dict."""
+    import subprocess
+    import sys
+
+    json_path = os.path.join(trace_dir, "viztracer.json")
+    script = f"""
+import sys, json
+sys.path.insert(0, {os.path.join(os.path.dirname(__file__))!r})
+from viztracer import VizTracer
+from workload import run_workload
+
+tracer = VizTracer(min_duration=0, ignore_frozen=False)
+tracer.start()
+run_workload()
+tracer.stop()
+tracer.save({json_path!r})
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, f"VizTracer failed: {result.stderr}"
+
+    with open(json_path) as f:
+        trace = json.load(f)
+    events = [e for e in trace["traceEvents"] if e.get("ph") == "X"]
+    from collections import Counter
+    return Counter(_short_name(e["name"]) for e in events)
+
+
+def _run_fasttracer_workload(trace_dir):
+    """Run workload under fasttracer, return {short_name: count} dict."""
+    import subprocess
+    import sys
+    from fasttracer.convert import convert_file
+
+    ftrc_dir = os.path.join(trace_dir, "ftrc")
+    script = f"""
+import sys
+sys.path.insert(0, {os.path.join(os.path.dirname(__file__))!r})
+from fasttracer import FastTracer
+from workload import run_workload
+
+with FastTracer(buffer_size=64 * 1024 * 1024, output_dir={ftrc_dir!r}):
+    run_workload()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, f"fasttracer failed: {result.stderr}"
+
+    ftrc_files = [
+        os.path.join(ftrc_dir, f)
+        for f in os.listdir(ftrc_dir)
+        if f.endswith(".ftrc")
+    ]
+    assert ftrc_files, "No .ftrc files produced"
+
+    all_events = []
+    for path in ftrc_files:
+        all_events.extend(convert_file(path))
+
+    from collections import Counter
+    return Counter(_short_name(e["name"]) for e in all_events)
+
+
+@pytest.fixture(scope="module")
+def ground_truth_counts():
+    """Run VizTracer once and cache the result for all ground truth tests."""
+    d = tempfile.mkdtemp(prefix="fasttracer_gt_")
+    try:
+        return _run_viztracer_ground_truth(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def fasttracer_counts():
+    """Run fasttracer once and cache the result for all ground truth tests."""
+    d = tempfile.mkdtemp(prefix="fasttracer_gt_")
+    try:
+        return _run_fasttracer_workload(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# Key Python functions that must appear with exact counts
+_EXPECTED_PYTHON_FUNCTIONS = {
+    "fibonacci": 177,
+    "run_workload": 1,
+    "process": 1,
+    "sort_data": 1,
+    "aggregate": 1,
+    "filter_outliers": 1,
+    "build_index": 1,
+    "merge_sorted": 1,
+    "safe_divide": 100,
+}
+
+# Key C builtins that must appear. Names may or may not have a module
+# prefix depending on whether PyCFunctionObject.m_module is set, so we
+# match on the method name suffix.
+_EXPECTED_C_BUILTINS = [
+    "append",   # merge_sorted, filter_outliers, etc.
+    "len",      # merge_sorted, aggregate
+    "abs",      # filter_outliers, safe_divide loop
+]
+
+
+def test_ground_truth_python_function_counts(ground_truth_counts, fasttracer_counts):
+    """Fasttracer must record the same Python function call counts as VizTracer."""
+    for func, expected_count in _EXPECTED_PYTHON_FUNCTIONS.items():
+        vt_count = ground_truth_counts.get(func, 0)
+        ft_count = fasttracer_counts.get(func, 0)
+        # VizTracer is the ground truth — verify it saw the expected count
+        assert vt_count == expected_count, (
+            f"VizTracer ground truth for {func}: expected {expected_count}, got {vt_count}"
+        )
+        # Fasttracer must match
+        assert ft_count == expected_count, (
+            f"fasttracer count for {func}: expected {expected_count}, got {ft_count} "
+            f"(VizTracer={vt_count})"
+        )
+
+
+def _find_by_suffix(counts, suffix):
+    """Find total count for all names ending with the given suffix."""
+    return sum(c for name, c in counts.items() if name.endswith(suffix))
+
+
+def test_ground_truth_c_builtins_present(ground_truth_counts, fasttracer_counts):
+    """Fasttracer must record the same C builtin functions as VizTracer."""
+    for func in _EXPECTED_C_BUILTINS:
+        vt_count = _find_by_suffix(ground_truth_counts, func)
+        ft_count = _find_by_suffix(fasttracer_counts, func)
+        assert vt_count > 0, f"VizTracer didn't record *{func}"
+        assert ft_count > 0, (
+            f"fasttracer missing C builtin *{func} (VizTracer={vt_count})"
+        )
+        # Allow some tolerance for C builtins (Python version differences)
+        ratio = ft_count / vt_count if vt_count else 0
+        assert 0.5 < ratio < 2.0, (
+            f"*{func} count mismatch: fasttracer={ft_count}, VizTracer={vt_count}, "
+            f"ratio={ratio:.2f}"
+        )
+
+
+def test_ground_truth_no_missing_functions(ground_truth_counts, fasttracer_counts):
+    """Every Python function seen by VizTracer with ≥5 calls must also
+    appear in fasttracer output (catches systematic interning failures)."""
+    # Filter to functions from our workload module
+    workload_funcs = {
+        name: count
+        for name, count in ground_truth_counts.items()
+        if count >= 5 and not name.startswith("_") and not name.startswith("<")
+    }
+
+    missing = []
+    for func, vt_count in workload_funcs.items():
+        ft_count = fasttracer_counts.get(func, 0)
+        if ft_count == 0:
+            # Try matching by method name suffix (C builtins may lack
+            # module prefix in fasttracer, e.g., "list.append" vs "append")
+            suffix = func.split(".")[-1] if "." in func else func
+            ft_count = _find_by_suffix(fasttracer_counts, suffix)
+        if ft_count == 0:
+            missing.append((func, vt_count))
+
+    assert not missing, (
+        f"Functions seen by VizTracer but missing from fasttracer: {missing}"
+    )
+
+
+def test_ground_truth_no_name_corruption(fasttracer_counts):
+    """No function name should appear with a suspiciously different count
+    than expected — catches name corruption where one function's events
+    are attributed to another."""
+    for func, expected in _EXPECTED_PYTHON_FUNCTIONS.items():
+        actual = fasttracer_counts.get(func, 0)
+        if expected > 0 and actual > 0:
+            ratio = actual / expected
+            assert 0.8 <= ratio <= 1.2, (
+                f"{func}: expected ~{expected}, got {actual} (ratio={ratio:.2f}) — "
+                "possible name corruption"
+            )
