@@ -14,16 +14,144 @@ static inline pid_t ft_gettid(void) {
     return (pid_t)syscall(SYS_gettid);
 }
 
+#include <signal.h>
+
 #include "fasttracer.h"
+
+/* ── Global instance for crash-safe flush ─────────────────────────── */
+
+/* Only one FastTracer per process; signal handlers need a global pointer. */
+static FastTracerObject* g_active_tracer = NULL;
+
+/* Saved signal handlers so we can chain after flushing */
+static struct sigaction g_old_sigterm;
+static struct sigaction g_old_sigabrt;
+static struct sigaction g_old_sigsegv;
 
 /* ── Forward declarations ──────────────────────────────────────────── */
 
+static void ft_make_output_path(FastTracerObject* self, char* buf, size_t buflen);
 static int  ft_flush_buffer(FastTracerObject* self, int sync);
 static uint32_t ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func);
 static struct ThreadStack* ft_get_thread_stack(FastTracerObject* self);
 static uint8_t ft_get_tid_idx(FastTracerObject* self);
 static void ft_rollover(FastTracerObject* self);
 static PyObject* ft_thread_profile_func(PyObject* obj, PyObject* args);
+
+/* ── Crash-safe flush (async-signal-safe) ─────────────────────────── */
+
+/*
+ * Emergency flush: write the active buffer directly to disk using only
+ * async-signal-safe functions (open, write, close).  Called from signal
+ * handlers and atexit — must not touch semaphores, mutexes, or malloc.
+ */
+static void
+ft_emergency_flush(FastTracerObject* self)
+{
+    if (!self || !self->collecting) return;
+    self->collecting = 0;  /* prevent re-entrant tracing */
+
+    int buf = self->active_buf;
+    size_t bytes_written = atomic_load_explicit(&self->write_offset, memory_order_relaxed);
+
+    uint32_t num_events = 0;
+    if (bytes_written > self->events_start) {
+        num_events = (uint32_t)((bytes_written - self->events_start) / sizeof(struct BinaryEvent));
+    }
+    if (num_events == 0) return;
+
+    /* Write header in-place */
+    struct BufferHeader* hdr = (struct BufferHeader*)self->buffers[buf];
+    hdr->magic = FT_MAGIC;
+    hdr->version = FT_VERSION;
+    hdr->pid = (uint32_t)self->pid;
+    hdr->base_ts_ns = self->base_ts_ns;
+    hdr->num_events = num_events;
+    hdr->num_strings = (uint32_t)self->intern.count;
+    hdr->num_threads = self->thread_map.count;
+    hdr->string_table_offset = (uint32_t)sizeof(struct BufferHeader);
+    hdr->events_offset = (uint32_t)self->events_start;
+
+    for (int i = 0; i < self->thread_map.count; i++) {
+        hdr->thread_table[i] = self->thread_map.entries[i].os_tid;
+    }
+
+    /* Copy string table */
+    size_t st_space = self->events_start - sizeof(struct BufferHeader);
+    size_t st_len = self->strings.len < st_space ? self->strings.len : st_space;
+    memcpy((char*)self->buffers[buf] + sizeof(struct BufferHeader),
+           self->strings.data, st_len);
+
+    /* Write to disk (all functions here are async-signal-safe) */
+    char path[512];
+    ft_make_output_path(self, path, sizeof(path));
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        size_t total = bytes_written;
+        size_t done = 0;
+        while (done < total) {
+            ssize_t n = write(fd, (char*)self->buffers[buf] + done, total - done);
+            if (n <= 0) break;
+            done += n;
+        }
+        close(fd);
+    }
+}
+
+static void
+ft_crash_signal_handler(int signo)
+{
+    ft_emergency_flush(g_active_tracer);
+    g_active_tracer = NULL;
+
+    /* Re-raise with the original handler so the process exits normally */
+    struct sigaction* old = NULL;
+    if (signo == SIGTERM) old = &g_old_sigterm;
+    else if (signo == SIGABRT) old = &g_old_sigabrt;
+    else if (signo == SIGSEGV) old = &g_old_sigsegv;
+
+    if (old && old->sa_handler != SIG_IGN && old->sa_handler != SIG_DFL) {
+        old->sa_handler(signo);
+    } else {
+        /* Restore default and re-raise */
+        signal(signo, SIG_DFL);
+        raise(signo);
+    }
+}
+
+static void
+ft_atexit_flush(void)
+{
+    ft_emergency_flush(g_active_tracer);
+    g_active_tracer = NULL;
+}
+
+static void
+ft_install_crash_handlers(FastTracerObject* self)
+{
+    g_active_tracer = self;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ft_crash_signal_handler;
+    sa.sa_flags = SA_RESETHAND;  /* one-shot: avoid re-entry loops */
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGTERM, &sa, &g_old_sigterm);
+    sigaction(SIGABRT, &sa, &g_old_sigabrt);
+    sigaction(SIGSEGV, &sa, &g_old_sigsegv);
+
+    atexit(ft_atexit_flush);
+}
+
+static void
+ft_remove_crash_handlers(void)
+{
+    g_active_tracer = NULL;
+    sigaction(SIGTERM, &g_old_sigterm, NULL);
+    sigaction(SIGABRT, &g_old_sigabrt, NULL);
+    sigaction(SIGSEGV, &g_old_sigsegv, NULL);
+}
 
 /* ── Writer thread ─────────────────────────────────────────────────── */
 
@@ -825,6 +953,13 @@ FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
 static void
 FastTracer_dealloc(FastTracerObject* self)
 {
+    /* If still collecting (stop() was never called), do an emergency flush */
+    if (self->collecting) {
+        self->collecting = 0;
+        ft_remove_crash_handlers();
+        ft_flush_buffer(self, 1);
+    }
+
     /* Shut down writer thread */
     if (self->writer_started) {
         /* Wait for any in-flight write to finish */
@@ -878,8 +1013,12 @@ FastTracer_start(FastTracerObject* self, PyObject* Py_UNUSED(unused))
         self->collecting = 0;
         return NULL;
     }
+    ft_install_crash_handlers(self);
 #else
     PyEval_SetProfile(ft_profile_callback, (PyObject*)self);
+
+    /* Install crash-safe flush handlers */
+    ft_install_crash_handlers(self);
 
     /* Also set profile for future threads via threading.setprofile.
      * We create a PyCFunction wrapping ft_thread_profile_func with
@@ -928,6 +1067,9 @@ FastTracer_stop(FastTracerObject* self, PyObject* Py_UNUSED(unused))
     }
     PyErr_Clear();
 #endif
+
+    /* Remove crash handlers (normal shutdown) */
+    ft_remove_crash_handlers();
 
     /* Synchronous final flush */
     ft_flush_buffer(self, 1);

@@ -944,3 +944,93 @@ def test_c_converter_multiple_files(trace_dir):
 
     assert any("alpha" in n for n in names), "Missing alpha events"
     assert any("beta" in n for n in names), "Missing beta events"
+
+
+# ── Crash-safe flush tests ─────────────────────────────────────────────
+
+
+def test_sigterm_flushes_trace(trace_dir):
+    """SIGTERM must produce a valid .ftrc file via emergency flush."""
+    import signal
+    import subprocess
+    import sys
+    from fasttracer.convert import convert_file
+
+    # Run a subprocess that starts tracing, does work, then receives SIGTERM
+    script = f"""
+import os, signal, time
+from fasttracer import FastTracer
+
+t = FastTracer(buffer_size=32 * 1024 * 1024, output_dir="{trace_dir}")
+t.start()
+
+# Generate enough events to be meaningful
+lst = []
+for i in range(5000):
+    lst.append(i)
+
+# Send SIGTERM to ourselves
+os.kill(os.getpid(), signal.SIGTERM)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    # Process should have been terminated by SIGTERM
+    assert result.returncode != 0, (
+        f"Expected non-zero exit, got {result.returncode}"
+    )
+
+    # Find the .ftrc file
+    ftrc_files = [f for f in os.listdir(trace_dir) if f.endswith(".ftrc")]
+    assert len(ftrc_files) >= 1, (
+        f"No .ftrc file produced after SIGTERM. Dir contents: {os.listdir(trace_dir)}"
+    )
+
+    # The file should be parseable and contain events
+    ftrc_path = os.path.join(trace_dir, ftrc_files[0])
+    events = convert_file(ftrc_path)
+    assert len(events) > 0, "SIGTERM flush produced an empty trace"
+
+    # Should contain append events from our workload
+    append_events = [e for e in events if "append" in e["name"]]
+    assert len(append_events) > 0, (
+        f"No append events found. Event names: {set(e['name'] for e in events[:20])}"
+    )
+
+
+def test_atexit_flushes_trace(trace_dir):
+    """Unhandled exceptions that exit Python must still produce a trace via atexit."""
+    import subprocess
+    import sys
+    from fasttracer.convert import convert_file
+
+    script = f"""
+from fasttracer import FastTracer
+
+t = FastTracer(buffer_size=32 * 1024 * 1024, output_dir="{trace_dir}")
+t.start()
+
+lst = []
+for i in range(5000):
+    lst.append(i)
+
+# Exit without calling stop() — atexit handler should flush
+raise RuntimeError("simulated crash")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode != 0
+
+    ftrc_files = [f for f in os.listdir(trace_dir) if f.endswith(".ftrc")]
+    assert len(ftrc_files) >= 1, (
+        f"No .ftrc file produced after exception exit. Dir: {os.listdir(trace_dir)}"
+    )
+
+    ftrc_path = os.path.join(trace_dir, ftrc_files[0])
+    events = convert_file(ftrc_path)
+    assert len(events) > 0, "atexit flush produced an empty trace"
