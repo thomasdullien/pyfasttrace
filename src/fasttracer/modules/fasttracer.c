@@ -583,11 +583,20 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
         return 0;
     }
 
-    /* Keep the object alive so its pointer remains a valid intern key.
-     * Without this, CPython reuses addresses for temporary bound method
-     * objects, corrupting the intern table. Objects are PyCodeObject and
-     * PyCFunctionObject — small metadata, not CUDA tensors. */
-    Py_INCREF(func_obj);
+    /* Keep PyCodeObject alive so its pointer remains a valid intern key.
+     * Without this, CPython could reuse the address, corrupting the table.
+     * PyCodeObject are small metadata with module-lifetime scope.
+     *
+     * Do NOT Py_INCREF PyCFunctionObject: these are temporary bound method
+     * objects (e.g., tensor.softmax) whose m_self references the bound
+     * instance.  Preventing their deallocation leaks whatever m_self points
+     * to — including GPU tensors, causing multi-GiB CUDA memory leaks.
+     * Pointer reuse for C functions is handled by the identity tag (ml_name
+     * hash): intern_lookup returns 0 on tag mismatch, triggering re-intern
+     * with a fresh func_id. */
+    if (!is_c_func) {
+        Py_INCREF(func_obj);
+    }
     if (intern_insert(&self->intern, (void*)func_obj, tag, fid) < 0) {
         return 0;
     }
