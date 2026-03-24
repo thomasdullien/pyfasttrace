@@ -12,8 +12,10 @@ class BuildExtWithConverter(build_ext):
         # Build the Python C extension as normal
         build_ext.run(self)
 
-        # Build ftrc2json standalone binary
-        src = os.path.join("src", "fasttracer", "modules", "ftrc2json.c")
+        # Build ftrc2json standalone binary (links libftrc)
+        modules_dir = os.path.join("src", "fasttracer", "modules")
+        src_ftrc2json = os.path.join(modules_dir, "ftrc2json.c")
+        src_libftrc = os.path.join(modules_dir, "libftrc.c")
         # Place the binary next to the Python package
         out_dir = os.path.join(self.build_lib, "fasttracer")
         os.makedirs(out_dir, exist_ok=True)
@@ -23,7 +25,8 @@ class BuildExtWithConverter(build_ext):
             "cc", "-std=c11", "-O2", "-Wall", "-Wextra",
             "-Wno-missing-field-initializers",
             "-D_GNU_SOURCE",
-            "-o", out, src,
+            "-I", modules_dir,
+            "-o", out, src_ftrc2json, src_libftrc,
         ]
         print(f"Building ftrc2json: {' '.join(cmd)}")
         subprocess.check_call(cmd)

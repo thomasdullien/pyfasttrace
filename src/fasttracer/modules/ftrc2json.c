@@ -3,113 +3,16 @@
  *
  * Usage: ftrc2json [-o output.json] input1.ftrc [input2.ftrc ...]
  *
- * Reads binary chunks, reconstructs string tables, emits Chrome Trace JSON.
- * Designed for multi-gigabyte inputs: mmap's the input, streams the output.
- *
- * Supports format v2 (12-byte events, uint32 func_id).
+ * Uses libftrc for parsing. Streams JSON output for multi-gigabyte inputs.
  */
 
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <errno.h>
 
-/* ── Must match fasttracer.h v2 ────────────────────────────────────── */
-
-#define FT_MAGIC       0x43525446
-#define FT_VERSION     2
-#define FT_MAX_THREADS 256
-
-/* Exit flag in the flags byte (v2) */
-#define FT_FLAG_EXIT       (1 << 7)
-#define FT_FLAG_C_FUNCTION (1 << 0)
-#define FT_FLAG_SYNTHETIC  (1 << 1)
-
-struct __attribute__((packed)) BinaryEvent {
-    uint32_t ts_delta_us;
-    uint32_t func_id;       /* full 32-bit string table index */
-    uint8_t  tid_idx;
-    uint8_t  flags;         /* bit 0: C function, bit 1: synthetic, bit 7: EXIT */
-    uint16_t _pad;
-};
-
-struct __attribute__((packed)) BufferHeader {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t pid;
-    uint32_t num_strings;   /* uint32 in v2 (was uint16 + pad in v1) */
-    int64_t  base_ts_ns;
-    uint32_t num_events;
-    uint8_t  num_threads;
-    uint8_t  _pad1;
-    uint16_t _pad2;
-    uint64_t thread_table[FT_MAX_THREADS];
-    uint32_t string_table_offset;
-    uint32_t events_offset;
-};
-
-/* ── String table: array of pointers + lengths ─────────────────────── */
-
-struct StringEntry {
-    const char* data;
-    uint32_t    len;
-};
-
-/*
- * Parse the string table from a chunk.
- * v2 uses uint32 length prefix per string.
- * Returns heap-allocated array of (num_strings+1) entries (index 0 = "<unknown>").
- * Caller must free the returned array.
- */
-static struct StringEntry*
-parse_string_table(const char* base, uint32_t st_offset, uint32_t num_strings,
-                   size_t chunk_size)
-{
-    struct StringEntry* strings = calloc(num_strings + 1, sizeof(struct StringEntry));
-    if (!strings) return NULL;
-
-    strings[0].data = "<unknown>";
-    strings[0].len = 9;
-
-    const char* p = base + st_offset;
-    const char* end = base + chunk_size;
-
-    for (uint32_t i = 0; i < num_strings; i++) {
-        if (p + 4 > end) break;
-        uint32_t slen;
-        memcpy(&slen, p, 4);
-        p += 4;
-        if (p + slen > end) break;
-        strings[i + 1].data = p;
-        strings[i + 1].len = slen;
-        p += slen;
-    }
-
-    return strings;
-}
-
-/* ── Per-thread stack for B→X conversion ──────────────────────────── */
-
-#define MAX_STACK_DEPTH 4096
-
-struct StackEntry {
-    double   ts;
-    uint32_t func_id;
-    uint8_t  flags;
-};
-
-struct ThreadStack {
-    struct StackEntry entries[MAX_STACK_DEPTH];
-    int depth;
-};
-
-static struct ThreadStack thread_stacks[FT_MAX_THREADS];
+#include "libftrc.h"
 
 /* ── Escape a string for JSON output ───────────────────────────────── */
 
@@ -141,175 +44,47 @@ fwrite_json_string(FILE* out, const char* s, uint32_t len)
 static int
 process_file(const char* path, FILE* out, int* first_event)
 {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
+    ftrc_reader* r = ftrc_open(path);
+    if (!r) {
+        fprintf(stderr, "Cannot open %s\n", path);
         return -1;
     }
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        fprintf(stderr, "Cannot stat %s: %s\n", path, strerror(errno));
-        close(fd);
-        return -1;
-    }
+    ftrc_event ev;
+    size_t count = 0;
 
-    size_t file_size = (size_t)st.st_size;
-    if (file_size == 0) {
-        close(fd);
-        return 0;
-    }
-
-    const char* data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (data == MAP_FAILED) {
-        fprintf(stderr, "Cannot mmap %s: %s\n", path, strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    /* Advise sequential access for readahead */
-    madvise((void*)data, file_size, MADV_SEQUENTIAL);
-
-    size_t offset = 0;
-    size_t total_events = 0;
-
-    while (offset + sizeof(struct BufferHeader) <= file_size) {
-        const struct BufferHeader* hdr = (const struct BufferHeader*)(data + offset);
-
-        if (hdr->magic != FT_MAGIC) {
-            fprintf(stderr, "Bad magic at offset %zu in %s: 0x%08x\n",
-                    offset, path, hdr->magic);
-            break;
-        }
-        if (hdr->version != FT_VERSION) {
-            fprintf(stderr, "Unknown version %u at offset %zu in %s (expected %d)\n",
-                    hdr->version, offset, path, FT_VERSION);
-            break;
-        }
-
-        /* Compute chunk size: events_offset + num_events * sizeof(BinaryEvent) */
-        size_t chunk_end = offset + hdr->events_offset +
-                           (size_t)hdr->num_events * sizeof(struct BinaryEvent);
-        if (chunk_end > file_size) {
-            fprintf(stderr, "Truncated chunk at offset %zu in %s\n", offset, path);
-            break;
-        }
-
-        /* Parse string table */
-        struct StringEntry* strings = parse_string_table(
-            data + offset, hdr->string_table_offset, hdr->num_strings,
-            chunk_end - offset);
-        if (!strings) {
-            fprintf(stderr, "Out of memory parsing string table\n");
-            break;
-        }
-
-        uint32_t num_strings = hdr->num_strings;
-
-        /* Emit process_name metadata (viztracer compat) */
+    while (ftrc_next(r, &ev) == 0) {
         if (!*first_event) {
             fputc(',', out);
         }
         *first_event = 0;
-        fprintf(out,
-            "{\"ph\":\"M\",\"pid\":%u,\"tid\":%lu,"
-            "\"name\":\"process_name\","
-            "\"args\":{\"name\":\"MainProcess\"}}",
-            hdr->pid,
-            (unsigned long)(hdr->num_threads > 0 ? hdr->thread_table[0] : 0));
 
-        /* Emit thread name metadata events */
-        for (uint8_t i = 0; i < hdr->num_threads; i++) {
-            fputc(',', out);
+        if (ev.type == FTRC_EVENT_METADATA) {
             fprintf(out,
                 "{\"ph\":\"M\",\"pid\":%u,\"tid\":%lu,"
-                "\"name\":\"thread_name\","
-                "\"args\":{\"name\":\"%s\"}}",
-                hdr->pid,
-                (unsigned long)hdr->thread_table[i],
-                i == 0 ? "MainThread" : "Thread");
-        }
-
-        /* Reset per-thread stacks for this chunk */
-        memset(thread_stacks, 0, sizeof(thread_stacks));
-
-        /* Walk events */
-        const struct BinaryEvent* events =
-            (const struct BinaryEvent*)(data + offset + hdr->events_offset);
-
-        for (uint32_t i = 0; i < hdr->num_events; i++) {
-            const struct BinaryEvent* ev = &events[i];
-
-            int is_exit = (ev->flags & FT_FLAG_EXIT) != 0;
-            uint32_t fid = ev->func_id;
-
-            /* Absolute timestamp in microseconds (CLOCK_MONOTONIC) */
-            double abs_ts_us = (double)hdr->base_ts_ns / 1000.0 +
-                               (double)ev->ts_delta_us;
-
-            /* Resolve thread ID */
-            uint64_t os_tid = ev->tid_idx;
-            if (ev->tid_idx < hdr->num_threads) {
-                os_tid = hdr->thread_table[ev->tid_idx];
-            }
-
-            uint8_t tidx = ev->tid_idx;
-
-            if (!is_exit) {
-                /* Push entry onto per-thread stack */
-                struct ThreadStack* ts = &thread_stacks[tidx];
-                if (ts->depth < MAX_STACK_DEPTH) {
-                    ts->entries[ts->depth].ts = abs_ts_us;
-                    ts->entries[ts->depth].func_id = fid;
-                    ts->entries[ts->depth].flags = ev->flags;
-                    ts->depth++;
-                }
+                "\"name\":",
+                ev.pid, (unsigned long)ev.tid);
+            fwrite_json_string(out, ev.name, ev.name_len);
+            if (ev.cat && strcmp(ev.cat, "thread_name") == 0) {
+                fputs(",\"args\":{\"name\":", out);
+                fwrite_json_string(out, ev.name, ev.name_len);
+                fputs("}}", out);
             } else {
-                /* Pop matching entry, emit "X" event */
-                struct ThreadStack* ts = &thread_stacks[tidx];
-                if (ts->depth <= 0) continue;
-                ts->depth--;
-
-                struct StackEntry* entry = &ts->entries[ts->depth];
-                double dur = abs_ts_us - entry->ts;
-
-                /* Resolve function name from the entry's func_id */
-                const char* name;
-                uint32_t name_len;
-                if (entry->func_id > 0 && entry->func_id <= num_strings) {
-                    name = strings[entry->func_id].data;
-                    name_len = strings[entry->func_id].len;
-                } else {
-                    name = "<unknown>";
-                    name_len = 9;
-                }
-
-                if (!*first_event) {
-                    fputc(',', out);
-                }
-                *first_event = 0;
-
-                /* Emit viztracer-compatible "X" event */
-                fprintf(out, "{\"pid\":%u,\"tid\":%lu,\"ts\":%.3f,\"ph\":\"X\",\"dur\":%.3f,\"name\":",
-                        hdr->pid,
-                        (unsigned long)os_tid,
-                        entry->ts,
-                        dur);
-                fwrite_json_string(out, name, name_len);
-                fputs(",\"cat\":\"FEE\"", out);
                 fputc('}', out);
             }
+        } else {
+            fprintf(out,
+                "{\"pid\":%u,\"tid\":%lu,\"ts\":%.3f,\"ph\":\"X\","
+                "\"dur\":%.3f,\"name\":",
+                ev.pid, (unsigned long)ev.tid, ev.ts_us, ev.dur_us);
+            fwrite_json_string(out, ev.name, ev.name_len);
+            fprintf(out, ",\"cat\":\"%s\"}", ev.cat ? ev.cat : "FEE");
+            count++;
         }
-
-        total_events += hdr->num_events;
-        free(strings);
-        offset = chunk_end;
     }
 
-    fprintf(stderr, "Read %zu events from %s\n", total_events, path);
-
-    munmap((void*)data, file_size);
-    close(fd);
+    fprintf(stderr, "Read %zu events from %s\n", count, path);
+    ftrc_close(r);
     return 0;
 }
 
@@ -321,26 +96,20 @@ main(int argc, char** argv)
     const char* output_path = NULL;
 
     /* Simple arg parsing */
+    const char** input_files = malloc(argc * sizeof(const char*));
+    int num_inputs = 0;
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-            output_path = argv[i + 1];
-            i++;
+            output_path = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stderr, "Usage: %s [-o output.json] input1.ftrc [input2.ftrc ...]\n",
                     argv[0]);
+            free(input_files);
             return 0;
+        } else {
+            input_files[num_inputs++] = argv[i];
         }
-    }
-
-    /* Collect input files (everything that's not -o or its argument) */
-    const char** input_files = malloc(argc * sizeof(const char*));
-    int num_inputs = 0;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-            i++;  /* skip -o and its argument */
-            continue;
-        }
-        input_files[num_inputs++] = argv[i];
     }
 
     if (num_inputs == 0) {
@@ -363,7 +132,7 @@ main(int argc, char** argv)
         out = stdout;
     }
 
-    /* Use a large output buffer for fewer write syscalls */
+    /* Large output buffer for fewer write syscalls */
     char* outbuf = malloc(4 * 1024 * 1024);
     if (outbuf) {
         setvbuf(out, outbuf, _IOFBF, 4 * 1024 * 1024);
