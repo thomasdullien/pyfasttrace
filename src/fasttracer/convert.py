@@ -139,7 +139,18 @@ def convert_chunk(data, offset=0):
 
 
 def convert_file(input_path):
-    """Read an .ftrc file and return all Chrome Trace events."""
+    """Read an .ftrc file and return all Chrome Trace events.
+
+    Uses the native C library (libftrc) for parsing. Falls back to
+    the pure-Python implementation if the C extension is unavailable.
+    """
+    try:
+        from fasttracer._fasttracer import read_ftrc
+        return read_ftrc(str(input_path))
+    except ImportError:
+        pass
+
+    # Pure-Python fallback
     data = Path(input_path).read_bytes()
     all_events = []
     offset = 0

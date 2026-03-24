@@ -40,10 +40,11 @@ fasttracer_ext = Extension(
     sources=[
         "src/fasttracer/modules/fasttracer.c",
         "src/fasttracer/modules/intern.c",
+        "src/fasttracer/modules/libftrc.c",
     ],
     include_dirs=["src/fasttracer/modules"],
     extra_compile_args=["-std=c11", "-O2", "-Wall", "-Wextra", "-Wno-missing-field-initializers"],
-    define_macros=[("_POSIX_C_SOURCE", "199309L")],
+    define_macros=[("_POSIX_C_SOURCE", "199309L"), ("_GNU_SOURCE", "1")],
 )
 
 setup(

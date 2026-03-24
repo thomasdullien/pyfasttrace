@@ -1174,6 +1174,80 @@ static PyTypeObject FastTracerType = {
     .tp_methods = FastTracer_methods,
 };
 
+/* ── ftrc file reader (wraps libftrc) ──────────────────────────────── */
+
+#include "libftrc.h"
+
+static PyObject*
+ft_read_ftrc(PyObject* Py_UNUSED(self), PyObject* args)
+{
+    const char* path;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+
+    ftrc_reader* r = ftrc_open(path);
+    if (!r) {
+        PyErr_Format(PyExc_OSError, "Cannot open ftrc file: %s", path);
+        return NULL;
+    }
+
+    PyObject* list = PyList_New(0);
+    if (!list) { ftrc_close(r); return NULL; }
+
+    ftrc_event ev;
+    while (ftrc_next(r, &ev) == 0) {
+        if (ev.type != FTRC_EVENT_COMPLETE) continue;
+
+        PyObject* dict = PyDict_New();
+        if (!dict) goto error;
+
+        PyObject* name = PyUnicode_DecodeUTF8(ev.name, ev.name_len, "replace");
+        if (!name) { Py_DECREF(dict); goto error; }
+        PyDict_SetItemString(dict, "name", name);
+        Py_DECREF(name);
+
+        PyObject* ts = PyFloat_FromDouble(ev.ts_us);
+        PyDict_SetItemString(dict, "ts", ts);
+        Py_DECREF(ts);
+
+        PyObject* dur = PyFloat_FromDouble(ev.dur_us);
+        PyDict_SetItemString(dict, "dur", dur);
+        Py_DECREF(dur);
+
+        PyObject* pid = PyLong_FromUnsignedLong(ev.pid);
+        PyDict_SetItemString(dict, "pid", pid);
+        Py_DECREF(pid);
+
+        PyObject* tid = PyLong_FromUnsignedLongLong(ev.tid);
+        PyDict_SetItemString(dict, "tid", tid);
+        Py_DECREF(tid);
+
+        PyObject* ph = PyUnicode_FromString("X");
+        PyDict_SetItemString(dict, "ph", ph);
+        Py_DECREF(ph);
+
+        PyObject* cat = PyUnicode_FromString(ev.cat ? ev.cat : "FEE");
+        PyDict_SetItemString(dict, "cat", cat);
+        Py_DECREF(cat);
+
+        if (PyList_Append(list, dict) < 0) { Py_DECREF(dict); goto error; }
+        Py_DECREF(dict);
+    }
+
+    ftrc_close(r);
+    return list;
+
+error:
+    ftrc_close(r);
+    Py_DECREF(list);
+    return NULL;
+}
+
+static PyMethodDef module_methods[] = {
+    {"read_ftrc", ft_read_ftrc, METH_VARARGS,
+     "Read a .ftrc file and return a list of event dicts."},
+    {NULL}
+};
+
 /* ── Module definition ─────────────────────────────────────────────── */
 
 static struct PyModuleDef fasttracer_module = {
@@ -1181,7 +1255,7 @@ static struct PyModuleDef fasttracer_module = {
     "_fasttracer",
     "High-performance binary trace recorder C extension",
     -1,
-    NULL,  /* m_methods */
+    module_methods,
     NULL,  /* m_slots */
     NULL,  /* m_traverse */
     NULL,  /* m_clear */
