@@ -20,8 +20,8 @@
 /* ── Binary format (must match fasttracer.h v2) ────────────────────── */
 
 #define FT_MAGIC       0x43525446
-#define FT_VERSION     2
 #define FT_MAX_THREADS 256
+#define FT_THREAD_NAME_LEN 64
 
 #define FT_FLAG_EXIT       (1 << 7)
 #define FT_FLAG_C_FUNCTION (1 << 0)
@@ -35,7 +35,8 @@ struct __attribute__((packed)) BinaryEvent {
     uint16_t _pad;
 };
 
-struct __attribute__((packed)) BufferHeader {
+/* v2 header (legacy) */
+struct __attribute__((packed)) BufferHeaderV2 {
     uint32_t magic;
     uint32_t version;
     uint32_t pid;
@@ -46,6 +47,24 @@ struct __attribute__((packed)) BufferHeader {
     uint8_t  _pad1;
     uint16_t _pad2;
     uint64_t thread_table[FT_MAX_THREADS];
+    uint32_t string_table_offset;
+    uint32_t events_offset;
+};
+
+/* v3 header (adds thread names) */
+struct __attribute__((packed)) BufferHeaderV3 {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t pid;
+    uint32_t num_strings;
+    int64_t  base_ts_ns;
+    uint32_t num_events;
+    uint8_t  num_threads;
+    uint8_t  _pad1;
+    uint16_t _pad2;
+    uint64_t thread_table[FT_MAX_THREADS];
+    char     thread_names[FT_MAX_THREADS][FT_THREAD_NAME_LEN];
+    char     process_name[FT_THREAD_NAME_LEN];
     uint32_t string_table_offset;
     uint32_t events_offset;
 };
@@ -73,6 +92,21 @@ struct ThreadStack {
 
 /* ── Reader state ──────────────────────────────────────────────────── */
 
+/* Unified chunk view — extracted from either v2 or v3 header */
+struct ChunkView {
+    uint32_t    pid;
+    uint32_t    num_strings;
+    int64_t     base_ts_ns;
+    uint32_t    num_events;
+    uint8_t     num_threads;
+    const uint64_t* thread_table;       /* points into mmap'd data */
+    /* v3 thread names (NULL for v2) */
+    const char  (*thread_names)[FT_THREAD_NAME_LEN];
+    const char* process_name;           /* NULL for v2 */
+    uint32_t    string_table_offset;
+    uint32_t    events_offset;
+};
+
 struct ftrc_reader {
     /* mmap */
     const char* data;
@@ -83,7 +117,8 @@ struct ftrc_reader {
     size_t      chunk_offset;       /* current position in file          */
 
     /* Current chunk state */
-    const struct BufferHeader* hdr;
+    struct ChunkView cv;
+    int         version;            /* 2 or 3                            */
     struct StringEntry* strings;    /* heap-allocated, num_strings+1     */
     uint32_t    num_strings;
     uint32_t    event_idx;          /* next raw event index in chunk     */
@@ -101,6 +136,7 @@ struct ftrc_reader {
 
     /* Static strings for metadata */
     char        meta_name_buf[256];
+    char        meta_value_buf[256];
 };
 
 /* ── Internal: advance to the next chunk ───────────────────────────── */
@@ -114,24 +150,62 @@ advance_to_next_chunk(ftrc_reader* r)
 
     if (r->chunk_offset >= r->file_size) return -1;
 
-    /* Find next valid chunk */
-    while (r->chunk_offset + sizeof(struct BufferHeader) <= r->file_size) {
-        const struct BufferHeader* hdr =
-            (const struct BufferHeader*)(r->data + r->chunk_offset);
+    /* Need at least enough bytes to read magic + version */
+    while (r->chunk_offset + 8 <= r->file_size) {
+        const char* base = r->data + r->chunk_offset;
+        uint32_t magic, version;
+        memcpy(&magic, base, 4);
+        memcpy(&version, base + 4, 4);
 
-        if (hdr->magic != FT_MAGIC) {
+        if (magic != FT_MAGIC) {
             fprintf(stderr, "libftrc: bad magic at offset %zu: 0x%08x\n",
-                    r->chunk_offset, hdr->magic);
-            return -1;
-        }
-        if (hdr->version != FT_VERSION) {
-            fprintf(stderr, "libftrc: unsupported version %u at offset %zu\n",
-                    hdr->version, r->chunk_offset);
+                    r->chunk_offset, magic);
             return -1;
         }
 
-        size_t chunk_end = r->chunk_offset + hdr->events_offset +
-                           (size_t)hdr->num_events * sizeof(struct BinaryEvent);
+        /* Parse header based on version */
+        struct ChunkView cv;
+        memset(&cv, 0, sizeof(cv));
+        size_t header_size;
+
+        if (version == 2) {
+            header_size = sizeof(struct BufferHeaderV2);
+            if (r->chunk_offset + header_size > r->file_size) return -1;
+            const struct BufferHeaderV2* h2 = (const struct BufferHeaderV2*)base;
+            cv.pid = h2->pid;
+            cv.num_strings = h2->num_strings;
+            cv.base_ts_ns = h2->base_ts_ns;
+            cv.num_events = h2->num_events;
+            cv.num_threads = h2->num_threads;
+            cv.thread_table = h2->thread_table;
+            cv.thread_names = NULL;   /* v2: no thread names */
+            cv.process_name = NULL;
+            cv.string_table_offset = h2->string_table_offset;
+            cv.events_offset = h2->events_offset;
+            r->version = 2;
+        } else if (version == 3) {
+            header_size = sizeof(struct BufferHeaderV3);
+            if (r->chunk_offset + header_size > r->file_size) return -1;
+            const struct BufferHeaderV3* h3 = (const struct BufferHeaderV3*)base;
+            cv.pid = h3->pid;
+            cv.num_strings = h3->num_strings;
+            cv.base_ts_ns = h3->base_ts_ns;
+            cv.num_events = h3->num_events;
+            cv.num_threads = h3->num_threads;
+            cv.thread_table = h3->thread_table;
+            cv.thread_names = (const char (*)[FT_THREAD_NAME_LEN])h3->thread_names;
+            cv.process_name = h3->process_name;
+            cv.string_table_offset = h3->string_table_offset;
+            cv.events_offset = h3->events_offset;
+            r->version = 3;
+        } else {
+            fprintf(stderr, "libftrc: unsupported version %u at offset %zu\n",
+                    version, r->chunk_offset);
+            return -1;
+        }
+
+        size_t chunk_end = r->chunk_offset + cv.events_offset +
+                           (size_t)cv.num_events * sizeof(struct BinaryEvent);
         if (chunk_end > r->file_size) {
             fprintf(stderr, "libftrc: truncated chunk at offset %zu\n",
                     r->chunk_offset);
@@ -140,16 +214,16 @@ advance_to_next_chunk(ftrc_reader* r)
 
         /* Parse string table */
         struct StringEntry* strings =
-            calloc(hdr->num_strings + 1, sizeof(struct StringEntry));
+            calloc(cv.num_strings + 1, sizeof(struct StringEntry));
         if (!strings) return -1;
 
         strings[0].data = "<unknown>";
         strings[0].len = 9;
 
-        const char* p = r->data + r->chunk_offset + hdr->string_table_offset;
+        const char* p = r->data + r->chunk_offset + cv.string_table_offset;
         const char* end = r->data + chunk_end;
 
-        for (uint32_t i = 0; i < hdr->num_strings; i++) {
+        for (uint32_t i = 0; i < cv.num_strings; i++) {
             if (p + 4 > end) break;
             uint32_t slen;
             memcpy(&slen, p, 4);
@@ -161,12 +235,12 @@ advance_to_next_chunk(ftrc_reader* r)
         }
 
         /* Set up chunk state */
-        r->hdr = hdr;
+        r->cv = cv;
         r->strings = strings;
-        r->num_strings = hdr->num_strings;
+        r->num_strings = cv.num_strings;
         r->event_idx = 0;
         r->events = (const struct BinaryEvent*)
-            (r->data + r->chunk_offset + hdr->events_offset);
+            (r->data + r->chunk_offset + cv.events_offset);
         r->chunk_end = chunk_end;
 
         /* Do NOT reset stacks between chunks within the same file.
@@ -241,39 +315,57 @@ ftrc_open(const char* path)
 int
 ftrc_next(ftrc_reader* r, ftrc_event* out)
 {
-    if (!r || !r->hdr) return -1;
+    if (!r || !r->cv.num_events) return -1;
 
     for (;;) {
         /* Phase 1: emit metadata events for current chunk */
         {
             /* Use the chunk's base timestamp for metadata events so they
              * don't skew clock alignment (ts=0 breaks the heuristic). */
-            double chunk_ts_us = (double)r->hdr->base_ts_ns / 1000.0;
+            double chunk_ts_us = (double)r->cv.base_ts_ns / 1000.0;
 
             if (r->meta_phase == 0) {
                 out->type = FTRC_EVENT_METADATA;
                 out->ts_us = chunk_ts_us;
                 out->dur_us = 0;
-                out->pid = r->hdr->pid;
-                out->tid = (r->hdr->num_threads > 0) ? r->hdr->thread_table[0] : 0;
+                out->pid = r->cv.pid;
+                out->tid = (r->cv.num_threads > 0) ? r->cv.thread_table[0] : 0;
                 out->name = "process_name";
                 out->name_len = 12;
+                /* Actual process name in meta_value */
+                if (r->cv.process_name && r->cv.process_name[0]) {
+                    snprintf(r->meta_value_buf, sizeof(r->meta_value_buf),
+                             "%s", r->cv.process_name);
+                } else {
+                    snprintf(r->meta_value_buf, sizeof(r->meta_value_buf),
+                             "python [%u]", r->cv.pid);
+                }
+                out->meta_value = r->meta_value_buf;
+                out->meta_value_len = (uint32_t)strlen(r->meta_value_buf);
                 out->cat = "metadata";
                 r->meta_phase = 1;
                 return 0;
             }
             if (r->meta_phase >= 1 &&
-                r->meta_phase <= (int)r->hdr->num_threads) {
+                r->meta_phase <= (int)r->cv.num_threads) {
                 int idx = r->meta_phase - 1;
                 out->type = FTRC_EVENT_METADATA;
                 out->ts_us = chunk_ts_us;
                 out->dur_us = 0;
-                out->pid = r->hdr->pid;
-                out->tid = r->hdr->thread_table[idx];
-                snprintf(r->meta_name_buf, sizeof(r->meta_name_buf),
-                         "%s", idx == 0 ? "MainThread" : "Thread");
-                out->name = r->meta_name_buf;
-                out->name_len = (uint32_t)strlen(r->meta_name_buf);
+                out->pid = r->cv.pid;
+                out->tid = r->cv.thread_table[idx];
+                out->name = "thread_name";
+                out->name_len = 11;
+                /* Actual thread name in meta_value */
+                if (r->cv.thread_names && r->cv.thread_names[idx][0]) {
+                    snprintf(r->meta_value_buf, sizeof(r->meta_value_buf),
+                             "%s", r->cv.thread_names[idx]);
+                } else {
+                    snprintf(r->meta_value_buf, sizeof(r->meta_value_buf),
+                             "%s", idx == 0 ? "MainThread" : "Thread");
+                }
+                out->meta_value = r->meta_value_buf;
+                out->meta_value_len = (uint32_t)strlen(r->meta_value_buf);
                 out->cat = "metadata";
                 r->meta_phase++;
                 return 0;
@@ -281,7 +373,7 @@ ftrc_next(ftrc_reader* r, ftrc_event* out)
         }
 
         /* Phase 2: process raw events, emit completed X events */
-        while (r->event_idx < r->hdr->num_events) {
+        while (r->event_idx < r->cv.num_events) {
             const struct BinaryEvent* ev = &r->events[r->event_idx];
             r->event_idx++;
             r->raw_events++;
@@ -289,12 +381,12 @@ ftrc_next(ftrc_reader* r, ftrc_event* out)
             int is_exit = (ev->flags & FT_FLAG_EXIT) != 0;
             uint32_t fid = ev->func_id;
 
-            double abs_ts_us = (double)r->hdr->base_ts_ns / 1000.0 +
+            double abs_ts_us = (double)r->cv.base_ts_ns / 1000.0 +
                                (double)ev->ts_delta_us;
 
             uint64_t os_tid = ev->tid_idx;
-            if (ev->tid_idx < r->hdr->num_threads) {
-                os_tid = r->hdr->thread_table[ev->tid_idx];
+            if (ev->tid_idx < r->cv.num_threads) {
+                os_tid = r->cv.thread_table[ev->tid_idx];
             }
 
             uint8_t tidx = ev->tid_idx;
@@ -326,7 +418,7 @@ ftrc_next(ftrc_reader* r, ftrc_event* out)
                 out->type = FTRC_EVENT_COMPLETE;
                 out->ts_us = entry->ts_us;
                 out->dur_us = abs_ts_us - entry->ts_us;
-                out->pid = r->hdr->pid;
+                out->pid = r->cv.pid;
                 out->tid = os_tid;
                 out->name = name;
                 out->name_len = name_len;

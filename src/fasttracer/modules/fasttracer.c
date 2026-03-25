@@ -74,7 +74,10 @@ ft_emergency_flush(FastTracerObject* self)
 
     for (int i = 0; i < self->thread_map.count; i++) {
         hdr->thread_table[i] = self->thread_map.entries[i].os_tid;
+        memcpy(hdr->thread_names[i], self->thread_map.entries[i].name,
+               FT_THREAD_NAME_LEN);
     }
+    memset(hdr->process_name, 0, FT_THREAD_NAME_LEN);
 
     /* Copy string table */
     size_t st_space = self->events_start - sizeof(struct BufferHeader);
@@ -535,8 +538,16 @@ ft_intern_key(PyObject* func_obj, int is_c_func)
          * constant to spread bits, then XOR into the base. */
         return (void*)(base ^ ((uintptr_t)line * 2654435761u));
     } else if (PyCFunction_Check(func_obj)) {
-        /* ml_name is a static const char* in the extension module */
-        return (void*)((PyCFunctionObject*)func_obj)->m_ml->ml_name;
+        /* Combine ml_name with the type of m_self (if bound) to distinguish
+         * e.g. Tensor.to from Module.to.  Both pointers are stable:
+         * ml_name is a static const char* in the extension .so, and
+         * tp_name is a static const char* in the type object. */
+        PyCFunctionObject* cfunc = (PyCFunctionObject*)func_obj;
+        uintptr_t key = (uintptr_t)cfunc->m_ml->ml_name;
+        if (cfunc->m_self) {
+            key ^= (uintptr_t)Py_TYPE(cfunc->m_self)->tp_name * 2654435761u;
+        }
+        return (void*)key;
     }
     return (void*)func_obj;  /* fallback: use object pointer */
 }
@@ -547,7 +558,18 @@ ft_intern_tag(PyObject* func_obj, int is_c_func)
     if (!is_c_func && PyCode_Check(func_obj)) {
         return (uint32_t)((PyCodeObject*)func_obj)->co_firstlineno;
     }
-    /* C functions: high bit set to distinguish from Python line numbers */
+    /* C functions: hash of tp_name to distinguish same-named methods on
+     * different types (e.g. Tensor.to vs Module.to). High bit set to
+     * avoid collisions with Python line-number tags. */
+    if (PyCFunction_Check(func_obj)) {
+        PyCFunctionObject* cfunc = (PyCFunctionObject*)func_obj;
+        if (cfunc->m_self) {
+            const char* tp = Py_TYPE(cfunc->m_self)->tp_name;
+            uint32_t h = 0x80000000u;
+            while (*tp) { h = h * 31 + (uint8_t)*tp++; }
+            return h | 0x80000000u;
+        }
+    }
     return 0x80000000u;
 }
 
@@ -587,14 +609,22 @@ ft_intern_function(FastTracerObject* self, PyObject* func_obj, int is_c_func)
     } else if (PyCFunction_Check(func_obj)) {
         PyCFunctionObject* cfunc = (PyCFunctionObject*)func_obj;
         const char* name = cfunc->m_ml->ml_name;
-        PyObject* module = cfunc->m_module;
 
-        if (module && PyUnicode_Check(module)) {
+        if (cfunc->m_self) {
+            /* Bound method: use TypeName.method_name for context */
+            const char* tp_name = Py_TYPE(cfunc->m_self)->tp_name;
             namelen = snprintf(namebuf, sizeof(namebuf), "%s.%s",
-                              PyUnicode_AsUTF8(module), name ? name : "?");
+                              tp_name, name ? name : "?");
         } else {
-            namelen = snprintf(namebuf, sizeof(namebuf), "%s",
-                              name ? name : "<unknown>");
+            /* Unbound: use module.function_name if available */
+            PyObject* module = cfunc->m_module;
+            if (module && PyUnicode_Check(module)) {
+                namelen = snprintf(namebuf, sizeof(namebuf), "%s.%s",
+                                  PyUnicode_AsUTF8(module), name ? name : "?");
+            } else {
+                namelen = snprintf(namebuf, sizeof(namebuf), "%s",
+                                  name ? name : "<unknown>");
+            }
         }
     } else {
         /* Fallback: use repr */
@@ -656,6 +686,29 @@ ft_get_thread_stack(FastTracerObject* self)
     return stack;
 }
 
+static void
+ft_capture_thread_name(struct ThreadMapEntry* entry)
+{
+    /* Try to get the Python thread name via threading.current_thread().name.
+     * This is called from the profiler callback, so we have the GIL. */
+    PyObject* threading = PyImport_ImportModule("threading");
+    if (!threading) { PyErr_Clear(); return; }
+
+    PyObject* current = PyObject_CallMethod(threading, "current_thread", NULL);
+    Py_DECREF(threading);
+    if (!current) { PyErr_Clear(); return; }
+
+    PyObject* name_obj = PyObject_GetAttrString(current, "name");
+    Py_DECREF(current);
+    if (!name_obj) { PyErr_Clear(); return; }
+
+    const char* name = PyUnicode_AsUTF8(name_obj);
+    if (name) {
+        snprintf(entry->name, FT_THREAD_NAME_LEN, "%s", name);
+    }
+    Py_DECREF(name_obj);
+}
+
 static uint8_t
 ft_get_tid_idx(FastTracerObject* self)
 {
@@ -676,6 +729,8 @@ ft_get_tid_idx(FastTracerObject* self)
     uint8_t idx = self->thread_map.count;
     self->thread_map.entries[idx].os_tid = os_tid;
     self->thread_map.entries[idx].tid_idx = idx;
+    self->thread_map.entries[idx].name[0] = '\0';
+    ft_capture_thread_name(&self->thread_map.entries[idx]);
     self->thread_map.count++;
     return idx;
 }
@@ -771,10 +826,13 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     hdr->string_table_offset = (uint32_t)sizeof(struct BufferHeader);
     hdr->events_offset = (uint32_t)self->events_start;
 
-    /* Copy thread table */
+    /* Copy thread table and names */
     for (int i = 0; i < self->thread_map.count; i++) {
         hdr->thread_table[i] = self->thread_map.entries[i].os_tid;
+        memcpy(hdr->thread_names[i], self->thread_map.entries[i].name,
+               FT_THREAD_NAME_LEN);
     }
+    memset(hdr->process_name, 0, FT_THREAD_NAME_LEN);
 
     /* Copy string table into buffer (between header and events) */
     size_t st_space = self->events_start - sizeof(struct BufferHeader);

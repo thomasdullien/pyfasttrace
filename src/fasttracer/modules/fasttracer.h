@@ -34,8 +34,9 @@ _Static_assert(sizeof(struct BinaryEvent) == 12, "BinaryEvent must be 12 bytes")
 /* ── Buffer header ─────────────────────────────────────────────────── */
 
 #define FT_MAGIC       0x43525446   /* "FTRC" in little-endian */
-#define FT_VERSION     2            /* v2: 12-byte events, uint32 func_id */
+#define FT_VERSION     3            /* v3: adds thread_name_ids            */
 #define FT_MAX_THREADS 256
+#define FT_THREAD_NAME_LEN 64      /* max bytes per thread name           */
 
 struct __attribute__((packed)) BufferHeader {
     uint32_t magic;
@@ -48,6 +49,8 @@ struct __attribute__((packed)) BufferHeader {
     uint8_t  _pad1;
     uint16_t _pad2;
     uint64_t thread_table[FT_MAX_THREADS]; /* tid_idx → OS thread ID     */
+    char     thread_names[FT_MAX_THREADS][FT_THREAD_NAME_LEN]; /* tid_idx → name */
+    char     process_name[FT_THREAD_NAME_LEN]; /* process name            */
     uint32_t string_table_offset;  /* byte offset from buffer start       */
     uint32_t events_offset;        /* byte offset from buffer start       */
 };
@@ -83,6 +86,7 @@ struct ThreadMapEntry {
     uint64_t os_tid;
     uint8_t  tid_idx;
     struct ThreadStack* stack;  /* pointer to TLS stack for rollover iteration */
+    char     name[FT_THREAD_NAME_LEN]; /* Python thread name                  */
 };
 
 struct ThreadMap {

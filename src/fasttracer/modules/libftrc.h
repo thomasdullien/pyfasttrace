@@ -37,6 +37,9 @@ typedef struct {
     uint32_t    name_len;   /* length of name (not null-terminated)          */
     const char* cat;        /* category string (static, null-terminated)     */
     int         type;       /* FTRC_EVENT_COMPLETE or FTRC_EVENT_METADATA    */
+    /* For metadata events: the metadata value (e.g. actual thread/process name) */
+    const char* meta_value;     /* null-terminated, valid until next ftrc_next() */
+    uint32_t    meta_value_len;
 } ftrc_event;
 
 /* ── Reader API ────────────────────────────────────────────────────── */
