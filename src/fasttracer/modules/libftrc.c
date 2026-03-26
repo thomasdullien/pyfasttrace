@@ -328,6 +328,7 @@ ftrc_next(ftrc_reader* r, ftrc_event* out)
                 out->type = FTRC_EVENT_METADATA;
                 out->ts_us = chunk_ts_us;
                 out->dur_us = 0;
+                out->depth = 0;
                 out->pid = r->cv.pid;
                 out->tid = (r->cv.num_threads > 0) ? r->cv.thread_table[0] : 0;
                 out->name = "process_name";
@@ -352,6 +353,7 @@ ftrc_next(ftrc_reader* r, ftrc_event* out)
                 out->type = FTRC_EVENT_METADATA;
                 out->ts_us = chunk_ts_us;
                 out->dur_us = 0;
+                out->depth = 0;
                 out->pid = r->cv.pid;
                 out->tid = r->cv.thread_table[idx];
                 out->name = "thread_name";
@@ -423,6 +425,7 @@ ftrc_next(ftrc_reader* r, ftrc_event* out)
                 out->name = name;
                 out->name_len = name_len;
                 out->cat = "FEE";
+                out->depth = ts->depth;  /* depth after pop = this event's depth */
                 return 0;
             }
         }
