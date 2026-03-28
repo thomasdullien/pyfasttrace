@@ -106,13 +106,22 @@ struct ThreadStack {
 
 /* ── Main tracer object ────────────────────────────────────────────── */
 
+#define FT_NUM_BUFFERS 4
+
+/* A pending flush request in the ring queue. */
+struct FlushRequest {
+    int    buf_index;
+    size_t bytes;
+    char   path[512];
+};
+
 typedef struct {
     PyObject_HEAD
 
-    /* Double buffer */
-    void*           buffers[2];
+    /* Ring of buffers */
+    void*           buffers[FT_NUM_BUFFERS];
     size_t          buffer_size;        /* size of each buffer in bytes      */
-    int             active_buf;         /* 0 or 1                            */
+    int             active_buf;         /* index of current write buffer     */
     _Atomic size_t  write_offset;       /* current write position            */
     size_t          events_start;       /* offset where events begin         */
 
@@ -130,13 +139,13 @@ typedef struct {
     struct ThreadMap thread_map;
     pthread_key_t   tls_key;            /* ThreadStack per thread            */
 
-    /* Writer thread (replaces fork-based flush to avoid CUDA conflicts) */
+    /* Writer thread */
     pthread_t       writer_thread;
-    sem_t           flush_sem;          /* posted when a buffer is ready     */
-    sem_t           flush_done;         /* posted when the write completes   */
-    int             flush_buf;          /* buffer index to write (0 or 1)    */
-    size_t          flush_bytes;        /* bytes to write                    */
-    char            flush_path[512];    /* output path for pending write     */
+    sem_t           flush_avail;        /* counts pending flush requests     */
+    sem_t           free_bufs;          /* counts free (writable) buffers    */
+    struct FlushRequest flush_queue[FT_NUM_BUFFERS];
+    int             flush_head;         /* next slot to enqueue (producer)   */
+    int             flush_tail;         /* next slot to dequeue (writer)     */
     int             writer_stop;        /* 1 = tell writer thread to exit    */
     int             writer_started;     /* 1 = thread was created            */
     char*           output_dir;         /* directory for .ftrc files         */

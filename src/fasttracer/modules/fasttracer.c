@@ -163,22 +163,28 @@ ft_writer_thread(void* arg)
 {
     FastTracerObject* self = (FastTracerObject*)arg;
     while (1) {
-        sem_wait(&self->flush_sem);
+        sem_wait(&self->flush_avail);
         if (self->writer_stop) break;
 
-        int fd = open(self->flush_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        /* Dequeue the next flush request */
+        struct FlushRequest* req = &self->flush_queue[self->flush_tail];
+        self->flush_tail = (self->flush_tail + 1) % FT_NUM_BUFFERS;
+
+        int fd = open(req->path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
             size_t written = 0;
-            while (written < self->flush_bytes) {
+            while (written < req->bytes) {
                 ssize_t n = write(fd,
-                    (char*)self->buffers[self->flush_buf] + written,
-                    self->flush_bytes - written);
+                    (char*)self->buffers[req->buf_index] + written,
+                    req->bytes - written);
                 if (n <= 0) break;
                 written += n;
             }
             close(fd);
         }
-        sem_post(&self->flush_done);
+
+        /* Mark this buffer as free for reuse */
+        sem_post(&self->free_bufs);
     }
     return NULL;
 }
@@ -855,44 +861,47 @@ ft_flush_buffer(FastTracerObject* self, int sync)
     memcpy((char*)self->buffers[buf_to_flush] + sizeof(struct BufferHeader),
            self->strings.data, st_len);
 
-    /* Switch to other buffer */
-    self->active_buf = 1 - self->active_buf;
+    /* Advance to next buffer in ring. Back-pressure: if no free buffer
+     * is available, sem_wait blocks until the writer finishes one. */
+    sem_wait(&self->free_bufs);
+    self->active_buf = (self->active_buf + 1) % FT_NUM_BUFFERS;
     self->base_ts_ns = ft_get_monotonic_ns();
     atomic_store_explicit(&self->write_offset, self->events_start, memory_order_relaxed);
 
     /* Total bytes to write: up to the end of events */
     size_t total_bytes = bytes_written;
 
-    /* Build output path */
-    char path[512];
-    ft_make_output_path(self, path, sizeof(path));
-
     if (sync) {
         /* Synchronous flush (called from stop() or rollover).
-         * Wait for any in-flight async write first. */
-        sem_wait(&self->flush_done);
+         * Write directly — no queueing to writer thread. */
+        char path[512];
+        ft_make_output_path(self, path, sizeof(path));
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
-            write(fd, self->buffers[buf_to_flush], total_bytes);
+            size_t done = 0;
+            while (done < total_bytes) {
+                ssize_t n = write(fd, (char*)self->buffers[buf_to_flush] + done,
+                                  total_bytes - done);
+                if (n <= 0) break;
+                done += n;
+            }
             close(fd);
         }
-        /* Re-post flush_done so future waits don't block */
-        sem_post(&self->flush_done);
+        /* Buffer is immediately free again */
+        sem_post(&self->free_bufs);
         self->cumulative_bytes += total_bytes;
         return 0;
     }
 
-    /* Async flush via writer thread (no fork — safe with CUDA) */
-    /* Wait for previous async write to complete (back-pressure) */
-    sem_wait(&self->flush_done);
-
-    /* Set up the flush request */
-    self->flush_buf = buf_to_flush;
-    self->flush_bytes = total_bytes;
-    ft_make_output_path(self, self->flush_path, sizeof(self->flush_path));
+    /* Async flush: enqueue for writer thread */
+    struct FlushRequest* req = &self->flush_queue[self->flush_head];
+    req->buf_index = buf_to_flush;
+    req->bytes = total_bytes;
+    ft_make_output_path(self, req->path, sizeof(req->path));
+    self->flush_head = (self->flush_head + 1) % FT_NUM_BUFFERS;
 
     /* Signal the writer thread */
-    sem_post(&self->flush_sem);
+    sem_post(&self->flush_avail);
 
     self->cumulative_bytes += total_bytes;
 
@@ -913,9 +922,12 @@ ft_rollover(FastTracerObject* self)
     int was_collecting = self->collecting;
     self->collecting = 0;
 
-    /* Wait for any in-flight async write to complete */
-    sem_wait(&self->flush_done);
-    sem_post(&self->flush_done);  /* re-post so sync flush doesn't block */
+    /* Drain all in-flight async writes by acquiring all free_bufs,
+     * then releasing them. This ensures the writer has finished. */
+    for (int i = 0; i < FT_NUM_BUFFERS - 1; i++)
+        sem_wait(&self->free_bufs);
+    for (int i = 0; i < FT_NUM_BUFFERS - 1; i++)
+        sem_post(&self->free_bufs);
 
     /* Emit synthetic exits for all open frames into active buffer */
     ft_emit_synthetic_exits(self);
@@ -946,8 +958,8 @@ FastTracer_new(PyTypeObject* type, PyObject* Py_UNUSED(args), PyObject* Py_UNUSE
     FastTracerObject* self = (FastTracerObject*)type->tp_alloc(type, 0);
     if (!self) return NULL;
 
-    self->buffers[0] = NULL;
-    self->buffers[1] = NULL;
+    for (int i = 0; i < FT_NUM_BUFFERS; i++)
+        self->buffers[i] = NULL;
     self->buffer_size = 0;
     self->active_buf = 0;
     self->write_offset = 0;
@@ -971,7 +983,7 @@ static int
 FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
 {
     static char* kwlist[] = {"buffer_size", "output_dir", "rollover_size", NULL};
-    Py_ssize_t buffer_size = 256 * 1024 * 1024;  /* 256MB default */
+    Py_ssize_t buffer_size = 1024 * 1024 * 1024LL;  /* 1GB default */
     const char* output_dir = "/tmp/fasttracer";
     Py_ssize_t rollover_size = 0;  /* 0 = disabled */
 
@@ -995,7 +1007,7 @@ FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
     self->buffer_size = (size_t)buffer_size;
 
     /* Allocate buffers via mmap */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < FT_NUM_BUFFERS; i++) {
         self->buffers[i] = mmap(NULL, self->buffer_size,
                                 PROT_READ | PROT_WRITE,
                                 MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -1011,10 +1023,13 @@ FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
     self->base_ts_ns = ft_get_monotonic_ns();
     self->pid = getpid();
 
-    /* Writer thread setup — init flush_done to 1 so the first
-     * sem_wait(&flush_done) in ft_flush_buffer returns immediately */
-    sem_init(&self->flush_sem, 0, 0);
-    sem_init(&self->flush_done, 0, 1);
+    /* Writer thread setup.
+     * free_bufs starts at NUM_BUFFERS-1: all buffers except the active one
+     * are available for switching. flush_avail starts at 0: no pending writes. */
+    sem_init(&self->flush_avail, 0, 0);
+    sem_init(&self->free_bufs, 0, FT_NUM_BUFFERS - 1);
+    self->flush_head = 0;
+    self->flush_tail = 0;
     atomic_store_explicit(&self->flush_in_progress, 0, memory_order_relaxed);
     self->writer_stop = 0;
     if (pthread_create(&self->writer_thread, NULL, ft_writer_thread, self) != 0) {
@@ -1065,17 +1080,18 @@ FastTracer_dealloc(FastTracerObject* self)
 
     /* Shut down writer thread */
     if (self->writer_started) {
-        /* Wait for any in-flight write to finish */
-        sem_wait(&self->flush_done);
+        /* Drain all in-flight writes */
+        for (int i = 0; i < FT_NUM_BUFFERS - 1; i++)
+            sem_wait(&self->free_bufs);
         /* Tell writer thread to exit */
         self->writer_stop = 1;
-        sem_post(&self->flush_sem);
+        sem_post(&self->flush_avail);
         pthread_join(self->writer_thread, NULL);
-        sem_destroy(&self->flush_sem);
-        sem_destroy(&self->flush_done);
+        sem_destroy(&self->flush_avail);
+        sem_destroy(&self->free_bufs);
     }
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < FT_NUM_BUFFERS; i++) {
         if (self->buffers[i] && self->buffers[i] != MAP_FAILED) {
             munmap(self->buffers[i], self->buffer_size);
         }
