@@ -218,18 +218,33 @@ ft_record_event(FastTracerObject* self, uint32_t func_id, uint8_t flags)
 
     /* Check if buffer is full */
     if (offset + sizeof(struct BinaryEvent) > self->buffer_size) {
-        /* Need to flush. Only one thread should do this. Try to be the one. */
-        /* For simplicity, we allow a small race: multiple threads may see
-           the buffer as full simultaneously. We use a simple approach:
-           flush and reset, accepting that a few events may be lost at the
-           boundary. A production implementation could use a CAS loop. */
-        ft_flush_buffer(self, 0);
-        /* After flush, write_offset has been reset. Re-allocate. */
+        /* Buffer full. Use CAS so exactly one thread performs the flush
+         * while others wait. Without this, multiple threads could
+         * simultaneously call ft_flush_buffer, corrupting buffer state. */
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(
+                &self->flush_in_progress, &expected, 1,
+                memory_order_acq_rel, memory_order_acquire)) {
+            /* Won the CAS — this thread flushes and switches buffers. */
+            ft_flush_buffer(self, 0);
+            atomic_store_explicit(&self->flush_in_progress, 0,
+                                  memory_order_release);
+        } else {
+            /* Another thread is flushing. Spin until it completes.
+             * The flush is fast (memcpy header + switch buffer + signal
+             * writer thread), so this spin is brief. */
+            while (atomic_load_explicit(&self->flush_in_progress,
+                                        memory_order_acquire))
+                ;  /* spin */
+        }
+
+        /* Retry allocation on the (now switched) buffer. */
         offset = atomic_fetch_add_explicit(
             &self->write_offset, sizeof(struct BinaryEvent), memory_order_relaxed);
         if (offset + sizeof(struct BinaryEvent) > self->buffer_size) {
-            /* Both buffers full, back-pressure wait happened, try once more */
-            return;  /* drop event rather than block indefinitely */
+            /* Writer thread hasn't freed a buffer yet. Drop event rather
+             * than block indefinitely (this holds the GIL on CPython). */
+            return;
         }
     }
 
@@ -1000,6 +1015,7 @@ FastTracer_init(FastTracerObject* self, PyObject* args, PyObject* kwds)
      * sem_wait(&flush_done) in ft_flush_buffer returns immediately */
     sem_init(&self->flush_sem, 0, 0);
     sem_init(&self->flush_done, 0, 1);
+    atomic_store_explicit(&self->flush_in_progress, 0, memory_order_relaxed);
     self->writer_stop = 0;
     if (pthread_create(&self->writer_thread, NULL, ft_writer_thread, self) != 0) {
         PyErr_SetFromErrno(PyExc_OSError);

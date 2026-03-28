@@ -146,6 +146,9 @@ typedef struct {
     size_t          cumulative_bytes;   /* bytes written to current file     */
     uint32_t        file_seq;           /* sequence number for file naming   */
 
+    /* Flush coordination */
+    _Atomic int     flush_in_progress;  /* CAS flag: 1 = a thread is flushing */
+
     /* State */
     int             collecting;         /* nonzero while tracing is active   */
     int             max_stack_depth;
