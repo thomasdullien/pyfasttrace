@@ -128,11 +128,24 @@ struct ftrc_reader {
     /* Per-thread stacks (persist across events within a chunk) */
     struct ThreadStack stacks[FT_MAX_THREADS];
 
+    /* Deduplication: fasttracer buffer flushes can produce overlapping
+     * chunks where the same raw events for a thread appear in both an
+     * earlier and a later chunk.  We track the last raw event timestamp
+     * per tid_idx and use it as a threshold when the next chunk has the
+     * same OS thread — raw events at or before the threshold are skipped. */
+    double      last_raw_ts[FT_MAX_THREADS];
+    /* Previous chunk's thread table, used to detect tid_idx remapping. */
+    uint64_t    prev_thread_table[FT_MAX_THREADS];
+    uint8_t     prev_num_threads;
+    /* Per-tid_idx: raw-event timestamp threshold; events <= this are skipped. */
+    double      dedup_threshold_ts[FT_MAX_THREADS];  /* 0 = no dedup */
+
     /* Metadata emission state */
     int         meta_phase;         /* 0=process_name, 1..N=thread_name, N+1=done */
 
     /* Stats */
     uint64_t    raw_events;
+    uint64_t    dedup_skipped;
 
     /* Static strings for metadata */
     char        meta_name_buf[256];
@@ -247,6 +260,36 @@ advance_to_next_chunk(ftrc_reader* r)
          * Chunks are buffer flushes, not separate traces — open call
          * frames from one chunk continue into the next. Only rollover
          * file boundaries should reset stacks. */
+
+        /* ── Deduplication setup ──────────────────────────────────────
+         * fasttracer may flush overlapping buffer contents: a later chunk
+         * can contain the same raw events for a thread that were already
+         * in an earlier chunk.  Detect this by matching OS TIDs between
+         * the previous and current chunk's thread tables. For any thread
+         * that appeared in both, set a dedup threshold so we skip
+         * completed events whose exit timestamp we've already seen. */
+        memset(r->dedup_threshold_ts, 0, sizeof(r->dedup_threshold_ts));
+        for (uint8_t new_idx = 0; new_idx < cv.num_threads; new_idx++) {
+            uint64_t new_tid = cv.thread_table[new_idx];
+            for (uint8_t old_idx = 0; old_idx < r->prev_num_threads; old_idx++) {
+                if (r->prev_thread_table[old_idx] == new_tid &&
+                    r->last_raw_ts[old_idx] > 0) {
+                    r->dedup_threshold_ts[new_idx] =
+                        r->last_raw_ts[old_idx];
+                    /* Carry forward the stack from the old tid_idx if the
+                     * index changed (thread table was re-ordered). */
+                    if (new_idx != old_idx) {
+                        r->stacks[new_idx] = r->stacks[old_idx];
+                    }
+                    break;
+                }
+            }
+        }
+
+        /* Save current thread table for next chunk transition */
+        memcpy(r->prev_thread_table, cv.thread_table,
+               cv.num_threads * sizeof(uint64_t));
+        r->prev_num_threads = cv.num_threads;
 
         /* Start metadata emission: process_name first, then thread names */
         r->meta_phase = 0;
@@ -383,16 +426,32 @@ ftrc_next(ftrc_reader* r, ftrc_event* out)
             int is_exit = (ev->flags & FT_FLAG_EXIT) != 0;
             uint32_t fid = ev->func_id;
 
+            uint8_t tidx = ev->tid_idx;
+            if (tidx >= FT_MAX_THREADS) tidx = FT_MAX_THREADS - 1;
+
             double abs_ts_us = (double)r->cv.base_ts_ns / 1000.0 +
                                (double)ev->ts_delta_us;
+
+            /* Track last raw timestamp per tid_idx for dedup threshold */
+            r->last_raw_ts[tidx] = abs_ts_us;
 
             uint64_t os_tid = ev->tid_idx;
             if (ev->tid_idx < r->cv.num_threads) {
                 os_tid = r->cv.thread_table[ev->tid_idx];
             }
 
-            uint8_t tidx = ev->tid_idx;
-            if (tidx >= FT_MAX_THREADS) tidx = FT_MAX_THREADS - 1;
+            /* Deduplication: skip raw events at or before the threshold
+             * for this tid_idx (already processed from a previous chunk). */
+            if (r->dedup_threshold_ts[tidx] > 0) {
+                if (abs_ts_us <= r->dedup_threshold_ts[tidx]) {
+                    r->dedup_skipped++;
+                    continue;  /* skip this raw event entirely */
+                }
+                /* Past the overlap region — disable dedup for this thread.
+                 * Reset the stack since we skipped the matching entries. */
+                r->dedup_threshold_ts[tidx] = 0;
+                r->stacks[tidx].depth = 0;
+            }
 
             if (!is_exit) {
                 /* Push entry */
