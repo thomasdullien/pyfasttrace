@@ -171,9 +171,93 @@ advance_to_next_chunk(ftrc_reader* r)
         memcpy(&version, base + 4, 4);
 
         if (magic != FT_MAGIC) {
-            fprintf(stderr, "libftrc: bad magic at offset %zu: 0x%08x\n",
-                    r->chunk_offset, magic);
-            return -1;
+            /* Scan for the next FT_MAGIC. fasttracer has an off-by-N
+             * concurrency bug at buffer rollover that can cause the previous
+             * chunk's reported size to overshoot the actual on-disk size by
+             * a small multiple of sizeof(BinaryEvent) (12 bytes). The real
+             * next chunk can be slightly *before* the computed chunk_offset
+             * (when the previous chunk's num_events was over-reported) or
+             * slightly *after* (when the previous chunk's events_offset was
+             * over-reported). Search both directions, picking the closest
+             * candidate.
+             *
+             * The backward scan bound prevents us from re-finding a magic
+             * inside the previous chunk's payload (we've already iterated
+             * through that). The forward bound caps pathological costs. */
+            size_t bad_offset = r->chunk_offset;
+            const size_t FORWARD_LIMIT = 1024 * 1024;
+            const size_t BACKWARD_LIMIT = 64 * 1024;
+            size_t scan_back_lo = (bad_offset > BACKWARD_LIMIT)
+                                  ? bad_offset - BACKWARD_LIMIT : 0;
+            size_t scan_fwd_hi = bad_offset + FORWARD_LIMIT;
+            if (scan_fwd_hi > r->file_size - 8) scan_fwd_hi = r->file_size - 8;
+
+            size_t best = 0;
+            int found = 0;
+            int direction = 0; /* -1 backward, +1 forward */
+            /* Try backward first (closer hits are more likely correct). */
+            for (size_t s = bad_offset; s >= scan_back_lo + 4; s--) {
+                /* Note: when s == bad_offset we already know magic doesn't
+                 * match, so start from s = bad_offset - 1. */
+                if (s == bad_offset) continue;
+                uint32_t m, v;
+                memcpy(&m, r->data + s, 4);
+                if (m != FT_MAGIC) {
+                    if (s == 0) break;
+                    continue;
+                }
+                memcpy(&v, r->data + s + 4, 4);
+                if (v != 2 && v != 3) {
+                    if (s == 0) break;
+                    continue;
+                }
+                size_t hsize = (v == 2)
+                    ? sizeof(struct BufferHeaderV2)
+                    : sizeof(struct BufferHeaderV3);
+                if (s + hsize > r->file_size) {
+                    if (s == 0) break;
+                    continue;
+                }
+                best = s;
+                found = 1;
+                direction = -1;
+                break;
+            }
+            /* If nothing backward, try forward. */
+            if (!found) {
+                for (size_t s = bad_offset + 4; s + 8 <= scan_fwd_hi; s++) {
+                    uint32_t m, v;
+                    memcpy(&m, r->data + s, 4);
+                    if (m != FT_MAGIC) continue;
+                    memcpy(&v, r->data + s + 4, 4);
+                    if (v != 2 && v != 3) continue;
+                    size_t hsize = (v == 2)
+                        ? sizeof(struct BufferHeaderV2)
+                        : sizeof(struct BufferHeaderV3);
+                    if (s + hsize > r->file_size) continue;
+                    best = s;
+                    found = 1;
+                    direction = +1;
+                    break;
+                }
+            }
+
+            if (!found) {
+                fprintf(stderr,
+                        "libftrc: bad magic at offset %zu: 0x%08x; "
+                        "no recoverable chunk within [-%zu, +%zu] bytes; stopping\n",
+                        bad_offset, magic, BACKWARD_LIMIT, FORWARD_LIMIT);
+                return -1;
+            }
+            ssize_t skipped = direction == -1
+                ? -(ssize_t)(bad_offset - best)
+                : (ssize_t)(best - bad_offset);
+            fprintf(stderr,
+                    "libftrc: bad magic at offset %zu: 0x%08x; "
+                    "recovered next chunk at offset %zu (offset %+zd bytes)\n",
+                    bad_offset, magic, best, skipped);
+            r->chunk_offset = best;
+            continue;  /* re-enter the loop with the new chunk_offset */
         }
 
         /* Parse header based on version */
